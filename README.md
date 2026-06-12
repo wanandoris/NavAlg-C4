@@ -3,7 +3,11 @@ model下1024的pt模型是有一定训练效果的，但2024则训崩了，只�
 此代码的亮点是
 1. 用了SAC但由于没有截断函数之类的效果可能不如PPO
 2. 设置奖励函数代码如下  经测试的确是有效果的.其中 distance_w 是 heading_r计算时的参数，与目标距离越小，对于heading奖励的放大效应越大    heading奖励则是在很大的值下趋于平滑
-       def setReward(self, state,action,heading,distance):       # 少一个方向reward    scanreward和obreward只能有一个好像
+
+
+
+
+   def setReward(self, state,action,heading,distance):       # 少一个方向reward    scanreward和obreward只能有一个好像
         obstacle_min_range = state[-2] / OBSTACLE_MIN_RANGE_W         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
         obstacle_r = (5-obstacle_min_range)*(5-obstacle_min_range)*5
         print("=======obstacle_r",obstacle_r,"======dis_to_obstacle===",obstacle_min_range)
