@@ -35,8 +35,8 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 MAX_EPOCH = 4000
 
-LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
-COLLISION_DISTANCE = 2     # 碰撞判定阈值(m)
+LASER_MAX_RANGE = 10.0        # 激光雷达有效最大距离(m)
+COLLISION_DISTANCE = 1     # 碰撞判定阈值(m)
 
 LOAD_MODEL_STEP = 10         #要加载的模型名称最后step的数字
 
@@ -591,12 +591,12 @@ class PPO_NAV:
 
     def setReward(self, state,action,heading,distance):       # 少一个方向reward    scanreward和obreward只能有一个好像
         obstacle_min_range = state[-2] / OBSTACLE_MIN_RANGE_W         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
-        obstacle_r = (5-obstacle_min_range)*(5-obstacle_min_range)*5
+        obstacle_r = (10-obstacle_min_range)
         print("=======obstacle_r",obstacle_r,"======dis_to_obstacle===",obstacle_min_range)
         distance_w = self.binary_cross_entropy_v1(1,(distance-self.arrive_distance)/600)/3     # ==========或许公式要改  与目标点最小距离，达到即判定抵达，与目前距离的交叉熵的平方除以三。我觉得这个数值合适
         print("=====distance=====",distance-self.arrive_distance,"=======dis_w=======",distance_w)
         
-        heading_r = distance_w*self.sigmoid_v1(5-abs(heading/9))*2  #===-1~1，对准时在0.9左右        #=============或许要改
+        heading_r = distance_w*self.sigmoid_v1(5-abs(heading/9))*2  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
         if heading_r < -30:
             heading_r = -30          #防止在目标旁边转向太猛扣太多，从而不敢去目标
         print("=====heading=====",heading,"======heading_r",heading_r)
