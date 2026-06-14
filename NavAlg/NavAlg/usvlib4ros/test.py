@@ -9,6 +9,28 @@ def sigmoid(x):
     """
     return 1 / (1 + np.exp(-x))
 
+
+    def get_action_and_value(self, x, action=None):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        
+        entropy = probs.entropy().sum(1)
+        x_t = probs.rsample()
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_scale + self.action_bias           #真正取动作
+        log_prob = probs.log_prob(x_t)
+        # Enforcing Action Bound
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        return action.detach(), log_prob,entropy,self.critic(x),
+    def get_action_and_value_learn(self,x,action):
+        action_mean = self.actor_mean(x)
+        action_logstd = self.actor_logstd.expand_as(action_mean)
+        action_std = torch.exp(action_logstd)
+        probs = Normal(action_mean, action_std)
+        return action.detach(), probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
 if __name__ == "__main__":
     # 1. 生成 1000 个测试数值（在 -10 到 10 之间均匀分布）
     num_points = 1000

@@ -104,6 +104,22 @@ class PPO_NAV:
                     value = 10
                 scan_range.append(value)
         return scan_range
+    
+    def _extract_laser_features_v1(self, scan) -> list:
+        
+        total_points = len(scan.ranges)
+        
+
+        scan_range = []
+        for i in range(total_points):
+            value = scan.ranges[i]
+            if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
+                scan_range.append(LASER_MAX_RANGE)
+            else:
+                if value > 10 :
+                    value = 10
+                scan_range.append(value)
+        return scan_range
 
 
     @staticmethod
@@ -270,7 +286,7 @@ class PPO_NAV:
         Returns:
             状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle]
         """
-        scan_range = self._extract_laser_features(scan)
+        scan_range = self._extract_laser_features_v1(scan)
         obstacle_min_range = round(min(scan_range), 2)
         obstacle_angle = np.argmin(scan_range)
         LogUtil.debug(
@@ -287,7 +303,7 @@ class PPO_NAV:
             self.arrive = True
         
         #scan_range = self.normalize_feature(scan_range)  #正则化
-        return np.append(scan_range , [heading*20, current_distance*5, obstacle_min_range*OBSTACLE_MIN_RANGE_W, obstacle_angle*20])   #乘上一个数是为了让模型放更大的注意在这些参数上
+        return np.append(scan_range , [heading*20, current_distance*10, obstacle_min_range*OBSTACLE_MIN_RANGE_W, obstacle_angle*20])   #乘上一个数是为了让模型放更大的注意在这些参数上
     
     
     

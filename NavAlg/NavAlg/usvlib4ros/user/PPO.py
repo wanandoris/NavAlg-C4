@@ -11,7 +11,7 @@ from collections import namedtuple
 
 ACTION_MAX =  np.array([1,2], dtype=np.float32)   #动作最大数值，它和min都是多维度numpy数据，对应不同的action====根据nav,这里两维度是speed==rotate
 ACTION_MIN = np.array([0,-2], dtype=np.float32)   #在nav里会把action*100，因此这里仅仅把范围限制在（0,1）和（-2,2）
-OBS_SPACE = (94,)    #======================修改294行self.obs
+OBS_SPACE = (184,)    #======================修改294行self.obs
 ACTION_SPACE = (2, )
 
 Transition = namedtuple(
@@ -95,26 +95,23 @@ class MODEL(nn.Module):
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(ACTION_SPACE)))
 
 
+
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(self, x, action=None):
+        action_ = None
         action_mean = self.actor_mean(x)
         action_logstd = self.actor_logstd.expand_as(action_mean)
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
-        if action == None:
-            entropy = probs.entropy().sum(1)
-            x_t = probs.rsample()
+        if action is None:
+            x_t = probs.rsample()  # 比普通sample多了梯度以便之后计算
             y_t = torch.tanh(x_t)
-            action = y_t * self.action_scale + self.action_bias           #真正取动作
-            log_prob = probs.log_prob(x_t)
-            # Enforcing Action Bound
-            log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-            log_prob = log_prob.sum(1, keepdim=True)
-            return action.detach(), log_prob,entropy,self.critic(x)
-        return action.detach(), probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
-    
+            action_ = y_t * self.action_scale + self.action_bias           #真正取动作
+            action = x_t.detach()
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x),action_
+
     
 class PPO:
     def __init__(self,ifload,file_path = r"D:\大赛资源\智能导航C4-2026\unpack\NavAlg-C4-v1\model"):
@@ -134,12 +131,14 @@ class PPO:
         self.values = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
         
         self.episode_r_list = []    #存储所有episoder，来判断训练效果。若效果变好，则降低lr
+        self.learntime = 0
         
         if ifload:                                  #保存
-            self.load(filepath= file_path)
+            self.load(self.agent,filepath= file_path)
         
 
     def learn(self,next_obs,next_done):
+        self.learntime += 1
         with torch.no_grad():
             next_value = self.agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(self.rewards).to(self.device)
@@ -172,7 +171,7 @@ class PPO:
                 end = start + self.args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue =self.agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
+                _, newlogprob, entropy, newvalue,_ =self.agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -222,29 +221,28 @@ class PPO:
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
         print("=================explained_var",explained_var)
         
-    def save(model, filepath,total_steps,episode_r):
+    def save(self,model, filepath,total_steps,episode_r):
         """
         保存 PPO 模型的检查点
         """
-        filepath = os.path.join(filepath, "ppo_%d_reward_%d.pt"%(total_steps,episode_r))
+        filepath = os.path.join(filepath, "ppo_%d_reward_%d.pt"%(total_steps,int(episode_r)))
         checkpoint = {
             'model_state_dict': model.state_dict(),          # 保存 actor 和 critic 的网络权重
-            'optimizer_state_dict': model.optimizer.state_dict(), # 保存优化器状态（如 Adam 的动量等）
+            'optimizer_state_dict': self.optimizer.state_dict(), # 保存优化器状态（如 Adam 的动量等）
         }
         torch.save(checkpoint, filepath)
         print(f"✅ Checkpoint saved successfully to {filepath}")
         
-    def load(model, filepath):
+    def load(self,model, filepath):
         """
         加载 PPO 模型的检查点
         """
-        checkpoint = torch.load(filepath, map_location=model.device) # 自动适配 CPU/GPU
+        checkpoint = torch.load(filepath, map_location=self.device) # 自动适配 CPU/GPU
         
         model.load_state_dict(checkpoint['model_state_dict'])
-        model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         print(f"🔄 Checkpoint loaded successfully from {filepath} ")
-        return model
 
 
     def anneal_lr(self,episode_r):
@@ -270,17 +268,20 @@ class PPO:
     
     def run(self,next_obs, reward, terminations,global_step,episode_r,iteration):
         step = global_step % self.args.num_steps
-        next_done = np.logical_or(terminations,0)
+        next_done = np.logical_or(terminations,0).astype(int)
         self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
-        next_obs, next_done = torch.Tensor(next_obs).to(self.device), torch.Tensor(next_done).to(self.device)
-        
+        next_obs, next_done = torch.tensor(next_obs,dtype=torch.float32).to(self.device), torch.tensor(next_done).to(self.device)
+        self.obs[step] = next_obs
+        print("============nextdone",next_done)
+        self.dones[step] = next_done
         with torch.no_grad():
-                action, logprob, _, value = self.agent.get_action_and_value(next_obs)
+                action, logprob, _, value,action_ = self.agent.get_action_and_value(next_obs)
                 self.values[step] = value.flatten()
         self.actions[step] = action
         self.logprobs[step] = logprob
-        if step == 0:
+        print("==========learntime",self.learntime)
+        if step == 0 and global_step > 0:
             self.learn(next_obs,next_done)
         if global_step % self.args.save == 0:
             self.save(self.agent,self.args.file,global_step,episode_r)
-        return action.cpu().numpy()
+        return action_.cpu().numpy()
