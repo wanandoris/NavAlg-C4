@@ -330,7 +330,7 @@ class SAC:
         
 
         
-    def run(self,next_obs, rewards, terminations,global_step):
+    def run(self,next_obs, rewards, terminations,global_step,episode_r):
         
         """
         需要：
@@ -357,7 +357,7 @@ class SAC:
             if global_step % self.args.learn_step ==0:
                 self.learn(global_step)
         if global_step % self.args.save == 0:
-            self.save(self.args.file,global_step)
+            self.save(self.args.file,global_step,episode_r)
         
         print("==训练次数",self.learn_time)
         return actions 
@@ -414,9 +414,9 @@ class SAC:
                 for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
                     target_param.data.copy_(self.args.tau * param.data + (1 - self.args.tau) * target_param.data)
     
-    def save(self, filepath: str, total_steps: int = 0):
+    def save(self, filepath: str, total_steps, episode_r):
         """保存 SAC 完整训练状态"""
-        filepath = os.path.join(filepath, "sac_%d.pt"%(total_steps))
+        filepath = os.path.join(filepath, "sac_%d_reward_%d.pt"%(total_steps,episode_r))
 
         checkpoint = {
             "actor": self.actor.state_dict(),

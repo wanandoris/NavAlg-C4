@@ -12,7 +12,7 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
-from usvlib4ros.user.SAC import SAC
+from usvlib4ros.user.PPO import PPO
 
 """笔记
 1. 203行打印的heading完全不能用，它只会在某一轮开始时更新。但直接调用scandadata是可以的
@@ -41,7 +41,7 @@ COLLISION_DISTANCE = 2     # 碰撞判定阈值(m)
 LOAD_MODEL_STEP = 10         #要加载的模型名称最后step的数字
 
 OBSTACLE_MIN_RANGE_W = 5    #这个是obstacle_min_range乘以多少放到state里。写在这是因为算奖励时从state里获取到障碍距离
-class SAC_NAV:
+class PPO_NAV:
     Instance = None
 
     """
@@ -60,7 +60,7 @@ class SAC_NAV:
         self.navThread = None
 
         #模型
-        self.ppo_agent = SAC(ifload=False,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\model\\.pt")
+        self.ppo_agent = PPO(ifload=False,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models\\.pt")
         self.next_state = None
         self.action_size = 5 #动作空间
         self.isbug = 0
@@ -89,7 +89,6 @@ class SAC_NAV:
         取中间180°范围内的数据点。
         """
         total_points = len(scan.ranges)
-        print("=======数量===",total_points)
         # 前方180°占总扫描范围的一半，取数组中间部分
         half_count = total_points // 2
         start_idx = half_count // 2          # 前90°起始索引
@@ -225,7 +224,7 @@ class SAC_NAV:
                         
                         #self._check_route_update()   #=========================新增，测试是否获取障碍点
 
-                        self.navigationHandler(self.next_state,e,t,global_step)
+                        self.navigationHandler(self.next_state,e,t,global_step,e)
 
                         
 
@@ -478,7 +477,7 @@ class SAC_NAV:
             'degreeAship' : degreeAship
         }
     
-    def navigationHandler(self,state,episode,step,global_step):
+    def navigationHandler(self,state,episode,step,global_step,e):
         """
         导航算法:
         """
@@ -544,7 +543,7 @@ class SAC_NAV:
             if state is None:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
             state = np.expand_dims(state, axis=0)     #增添维度适应SAC类要求
-            action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum)
+            action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,e)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
             print("===========time",time)
             
@@ -553,6 +552,8 @@ class SAC_NAV:
             self.next_state, self.reward, advisedHeading, =\
                 self.step(state.tolist(),action,laser_scan,heading, shipToNextWPDistance)
             self.episode_reward_sum += self.reward
+            
+            self.ppo_agent.anneal_lr(self.episode_reward_sum)         #依据奖励调整学习率
             
             """算法输出结果保存到global_data"""
             self.global_data.updateAlgorithmOutput(episode, step, int(self.episode_reward_sum), self.reward, MAX_EPOCH, 2)
@@ -586,10 +587,9 @@ class SAC_NAV:
 
         speed_r = action[0,0]*7                            #==========速度越大奖励越高。具体还得测试
         if distance<=5:
-            goal_r = (5-distance)*(5-distance)*5
-        else:
-            goal_r = 0
-        reward = heading_r+speed_r-obstacle_r+goal_r     #朝向+速度（较小）-障碍距离+目标距离（与障碍抵消）
+            obstacle_r = 0
+        
+        reward = heading_r+speed_r-obstacle_r     #朝向+速度（较小）-障碍距离
         print("=======total_r",reward)
         if self.arrive:
             LogUtil.info("Goal!!")

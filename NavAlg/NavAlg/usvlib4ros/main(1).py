@@ -10,7 +10,7 @@ from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros import GlobalData
 from usvlib4ros import USVAutoNavigationService
-from usvlib4ros.user.nav_2 import DQN_NAV
+from usvlib4ros.user.PPO_NAV import PPO_NAV
 
 
 def load_config():
@@ -47,7 +47,7 @@ class USVNavMain:
         cls.rosCtrl = rosCtrl
         # navigationService = USVAutoNavigationService(rosCtrl=rosCtrl, globalData=globalData)
         # navigationService.startService()
-        nav = DQN_NAV(ros_ctrl=rosCtrl,global_data=globalData)
+        nav = PPO_NAV(ros_ctrl=rosCtrl,global_data=globalData)
         nav.startService()
         pass
 
