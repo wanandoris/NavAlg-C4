@@ -558,7 +558,6 @@ class PPO_NAV:
             """第一次进入导航"""
             if state is None:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
-            state = np.expand_dims(state, axis=0)     #增添维度适应SAC类要求
             action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,e)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
             print("===========time",time)
@@ -591,8 +590,8 @@ class PPO_NAV:
 
     def setReward(self, state,action,heading,distance):       # 少一个方向reward    scanreward和obreward只能有一个好像
         obstacle_min_range = state[-2] / OBSTACLE_MIN_RANGE_W         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
-        obstacle_r = (10-obstacle_min_range)
-        print("=======obstacle_r",obstacle_r,"======dis_to_obstacle===",obstacle_min_range)
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
+        print("=======obstacle_r",obstacle_r,"======dis_to_obstacle===",(10-obstacle_min_range+0.9)/10)
         distance_w = self.binary_cross_entropy_v1(1,(distance-self.arrive_distance)/600)/3     # ==========或许公式要改  与目标点最小距离，达到即判定抵达，与目前距离的交叉熵的平方除以三。我觉得这个数值合适
         print("=====distance=====",distance-self.arrive_distance,"=======dis_w=======",distance_w)
         

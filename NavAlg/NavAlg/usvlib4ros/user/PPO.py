@@ -11,8 +11,12 @@ from collections import namedtuple
 
 ACTION_MAX =  np.array([1,2], dtype=np.float32)   #动作最大数值，它和min都是多维度numpy数据，对应不同的action====根据nav,这里两维度是speed==rotate
 ACTION_MIN = np.array([0,-2], dtype=np.float32)   #在nav里会把action*100，因此这里仅仅把范围限制在（0,1）和（-2,2）
-OBS_SPACE = (184,)    #======================修改294行self.obs
-ACTION_SPACE = (2, )
+OBS_DIM = 184
+ACTION_DIM = 2
+
+OBS_SPACE = (OBS_DIM + ACTION_DIM,)
+ACTION_SPACE = (ACTION_DIM,)
+
 
 Transition = namedtuple(
     'Transition',
@@ -129,6 +133,7 @@ class PPO:
         self.rewards = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
         self.dones = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
         self.values = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
+        self.action = torch.zeros((2,)).to(self.device)
         
         self.episode_r_list = []    #存储所有episoder，来判断训练效果。若效果变好，则降低lr
         self.learntime = 0
@@ -271,13 +276,15 @@ class PPO:
         next_done = np.logical_or(terminations,0).astype(int)
         self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
         next_obs, next_done = torch.tensor(next_obs,dtype=torch.float32).to(self.device), torch.tensor(next_done).to(self.device)
-        self.obs[step] = next_obs
+        next_obs = torch.cat([next_obs,self.action],dim=0).unsqueeze(0) 
         print("============nextdone",next_done)
         self.dones[step] = next_done
         with torch.no_grad():
                 action, logprob, _, value,action_ = self.agent.get_action_and_value(next_obs)
                 self.values[step] = value.flatten()
         self.actions[step] = action
+        self.action = action.squeeze(0)
+        self.obs[step] = next_obs
         self.logprobs[step] = logprob
         print("==========learntime",self.learntime)
         if step == 0 and global_step > 0:
