@@ -1,7 +1,7 @@
 {
     "ros2": {
-        "host": "192.168.11.128",
+        "host": "192.168.88.128",
         "port": 9090,
-        "deviceId": "ID_5af5ca42334f709d7fcb26519f87063fd6e16fdd"
+        "deviceId": "ID_640ae00068627cfdb5fd743d57ed3d03b610a34b"
     }
 }

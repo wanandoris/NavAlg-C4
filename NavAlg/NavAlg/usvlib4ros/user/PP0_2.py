@@ -4,6 +4,8 @@ import torch.nn as nn
 import math
 from torch.distributions import Categorical, MultivariateNormal
 
+from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter
+
 logger = logging.getLogger(__name__)
 
 # Device configuration
@@ -200,7 +202,7 @@ class PPO:
                  lr_actor: float, lr_critic: float,
                  gamma: float, K_epochs: int, eps_clip: float,
                  has_continuous_action_space: bool, action_std_init: float,
-                 gae_lambda: float = 0.95):
+                 writer=None, gae_lambda: float = 0.95):
         """初始化 PPO 算法的超参数、网络和优化器。
 
         Args:
@@ -238,6 +240,8 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.mse_loss = nn.MSELoss()   # 用于 Critic 的损失函数
+        self.tb_writer = TensorBoardMetricsWriter(writer=writer) if writer is not None else None
+        self.update_step = 0
 
     @staticmethod
     def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -300,13 +304,15 @@ class PPO:
             next_value = old_state_values[step]
 
         returns = advantages + old_state_values
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-7)
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-7)
 
         # ========== 3. 多次 epoch 更新策略 ==========
         actor_loss_value = 0.0
         critic_loss_value = 0.0
         total_loss_value = 0.0
         entropy_value = 0.0
+        ratio_mean_value = 0.0
+        advantage_mean_value = advantages.mean().item()
         for _ in range(self.K_epochs):
             # 在当前策略下评估这批数据
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions)
@@ -333,6 +339,8 @@ class PPO:
             critic_loss_value = critic_loss.item()
             total_loss_value = loss.mean().item()
             entropy_value = entropy_bonus.mean().item()
+            ratio_mean_value = ratios.mean().item()
+            advantage_mean_value = advantages.mean().item()
 
             # 反向传播与参数更新
             self.optimizer.zero_grad()
@@ -340,6 +348,18 @@ class PPO:
             # 梯度裁剪防止梯度爆炸
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
             self.optimizer.step()
+
+        if self.tb_writer is not None:
+            self.tb_writer.log_update(
+                self.update_step,
+                total_loss_value,
+                actor_loss_value,
+                critic_loss_value,
+                entropy_value,
+                ratio_mean_value,
+                advantage_mean_value,
+            )
+        self.update_step += 1
 
         # 更新完成后,将旧策略网络同步为当前策略网络
         self.policy_old.load_state_dict(self.policy.state_dict())

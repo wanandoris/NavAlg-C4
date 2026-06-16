@@ -2,12 +2,11 @@
 import time
 import threading
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import csv
-import os
-from pathlib import Path
 import cv2
-from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown
 
 import numpy as np
 import torch
@@ -17,8 +16,10 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
+from usvlib4ros.user.episode_logging import EpisodeDataLogger
 from usvlib4ros.user.PP0_2 import PPO, device
-from usvlib4ros.user.reward import RewardConfig, compute_reward, calc_apf_heading_diff
+from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown, calc_apf_heading_diff
+from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
 from usvlib4ros.user.training_logger import TrainingLogger
 
 # ==================== 超参数配置 ====================
@@ -38,6 +39,7 @@ MAX_STEP_PER_EPISODE = 3000   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
 UPDATE_INTERVAL = 2000  # PPO更新间隔(步数)
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
+RESET_SETTLE_DELAY = 3.0  # 每轮复位后等待仿真刷新(秒)
 
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
@@ -52,9 +54,9 @@ ACTION_TO_DEGREE_SCALE = 1   # 动作到转向角度的缩放因子
 ACTION_TO_DEGREE_CONTINOUS_SCALE = 100 # 连续动作映射到转向角度缩放因子
 ACTION_TO_SPEED_CONTINOUS_SCALE = 200 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
-TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0   # 屏蔽目标回波时的角度窗口(度)
-TARGET_ECHO_RANGE_MARGIN = 1.0       # 屏蔽目标回波时的距离容差(m)
-TARGET_ECHO_MIN_DISTANCE = 0.5       # 太近时不再做目标回波屏蔽，避免穿障
+TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0
+TARGET_ECHO_RANGE_MARGIN = 1.0
+TARGET_ECHO_MIN_DISTANCE = 0.5
 ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 
@@ -99,6 +101,12 @@ class PPONav:
         self.ros_ctrl: Ros2Controller = ros_ctrl
         self.global_data: GlobalData = global_data
         self.navThread = None
+        self.current_episode_step = 0
+        self.tb_log_dir = build_tensorboard_log_dir(Path.cwd() / "runs")
+        self.tb_writer = TensorBoardMetricsWriter(log_dir=self.tb_log_dir)
+        self.enable_episode_logging = False
+        self.episode_log_dir = Path.cwd() / "logs"
+        self.episode_logger = None
 
         # 数据收集控制
         self.data_collection_count = 0
@@ -114,7 +122,8 @@ class PPONav:
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
-            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT
+            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT,
+            writer=self.tb_writer.writer
         )
         self.next_state = None
         self.action_size = N_ACTIONS  # 动作空间大小(用于角度映射)
@@ -166,96 +175,109 @@ class PPONav:
                         LogUtil.info("停止训练")
                         break
 
-                    LogUtil.info(f"第 {epoch} 轮训练开始")
+                    try:
+                        LogUtil.info(f"第 {epoch} 轮训练开始")
+                        self._start_episode_logging(epoch)
+                        last_update_metrics = None
 
-                    # 复位Unity环境
-                    self.ros_ctrl.reset_unity()
-                    time.sleep(0.1)
-                    while self.global_data.device_data.reset_status != 2:
+                        # 复位Unity环境
+                        self.ros_ctrl.reset_unity()
                         time.sleep(0.1)
+                        while self.global_data.device_data.reset_status != 2:
+                            time.sleep(0.1)
 
-                    self.ros_ctrl.set_auto_work()
+                        time.sleep(RESET_SETTLE_DELAY)
+                        self.ros_ctrl.set_auto_work()
 
-                    # 加载航线
-                    self.route = self.ros_ctrl.getRoute()
-                    if len(self.route.points) == 0:
-                        LogUtil.error("航线数据为空")
-                        time.sleep(0.1)
-                        continue
+                        # 加载航线
+                        self.route = self.ros_ctrl.getRoute()
+                        if len(self.route.points) == 0:
+                            LogUtil.error("航线数据为空")
+                            time.sleep(0.1)
+                            continue
 
-                    LogUtil.info(f"航线加载完成: {self.route}")
+                        LogUtil.info(f"航线加载完成: {self.route}")
 
-                    # 初始化本轮状态
-                    self._reset_episode_state()
-                    self.global_data.route = self.route
-                    self.__reloadNavigationRoute(self.route)
+                        # 初始化本轮状态
+                        self._reset_episode_state()
+                        self.global_data.route = self.route
+                        self.__reloadNavigationRoute(self.route)
 
-                    # 本轮导航循环
-                    self.episode_start_time = time.time()
-                    self.episode_step_count = 0
-                    self.timeout = False
-                    last_update_metrics = None
-                    for step in range(MAX_STEP_PER_EPISODE):
-                        if self.global_data.device_data.task_status == 0:
-                            LogUtil.info(f"步骤 {step} 停止训练")
-                            break
+                        # 本轮导航循环
+                        self.episode_start_time = time.time()
+                        self.episode_step_count = 0
+                        self.timeout = False
+                        for step in range(MAX_STEP_PER_EPISODE):
+                            self.current_episode_step = step + 1
+                            self.episode_step_count = self.current_episode_step
+                            if self.global_data.device_data.task_status == 0:
+                                LogUtil.info(f"步骤 {step} 停止训练")
+                                break
 
-                        if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
-                            LogUtil.info("本轮超时,提前结束")
-                            self.timeout = True
-                            break
+                            if (time.time() - self.episode_start_time) > MAX_EPISODE_TIME:
+                                LogUtil.info("本轮超时,提前结束")
+                                self.timeout = True
+                                break
 
-                        self.episode_step_count = step + 1
-                        self.done = self.navigationHandler(self.next_state, epoch, step)
+                            self.done = self.navigationHandler(self.next_state, epoch, step)
 
-                        # 定期更新PPO
-                        if step > 0 and step % UPDATE_INTERVAL == 0:
+                            # 定期更新PPO
+                            if step > 0 and step % UPDATE_INTERVAL == 0:
+                                last_update_metrics = self.ppo_agent.update()
+                                self.training_logger.log_update(
+                                    epoch * MAX_STEP_PER_EPISODE + step,
+                                    last_update_metrics,
+                                )
+
+                            self.setMonitorParameterValue()
+
+                            if self.done or self.arrive:
+                                self._log_episode_metrics(epoch)
+                                break
+
+                            time.sleep(0.1)
+
+                        if not self.done and not self.arrive and self.current_episode_step > 0:
+                            self._log_episode_metrics(epoch)
+
+                        if self.ppo_agent.buffer.rewards:
                             last_update_metrics = self.ppo_agent.update()
                             self.training_logger.log_update(
-                                epoch * MAX_STEP_PER_EPISODE + step,
+                                epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
                                 last_update_metrics,
                             )
 
-                        self.setMonitorParameterValue()
+                        # 定期保存模型
+                        if epoch % CHECKPOINT_INTERVAL == 0:
+                            checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{epoch}.pth"
+                            self.ppo_agent.save(checkpoint_path)
+                            LogUtil.info(f"模型已保存: {checkpoint_path}")
 
-                        if self.done or self.arrive:
-                            break
-
-                        time.sleep(0.1)
-
-                    if self.ppo_agent.buffer.rewards:
-                        last_update_metrics = self.ppo_agent.update()
-                        self.training_logger.log_update(
-                            epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
-                            last_update_metrics,
+                        self.training_logger.log_episode(
+                            episode=epoch,
+                            episode_return=self.episode_reward_sum,
+                            steps=self.episode_step_count,
+                            episode_time_sec=(time.time() - self.episode_start_time) if self.episode_start_time else 0.0,
+                            arrived=self.arrive,
+                            collided=self.done and not self.arrive,
+                            timeout=self.timeout and not self.done and not self.arrive,
+                            last_update_metrics=last_update_metrics,
                         )
-
-                    # 定期保存模型
-                    if epoch % CHECKPOINT_INTERVAL == 0:
-                        checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{epoch}.pth"
-                        self.ppo_agent.save(checkpoint_path)
-                        LogUtil.info(f"模型已保存: {checkpoint_path}")
-
-                    self.training_logger.log_episode(
-                        episode=epoch,
-                        episode_return=self.episode_reward_sum,
-                        steps=self.episode_step_count,
-                        episode_time_sec=(time.time() - self.episode_start_time) if self.episode_start_time else 0.0,
-                        arrived=self.arrive,
-                        collided=self.done and not self.arrive,
-                        timeout=self.timeout and not self.done and not self.arrive,
-                        last_update_metrics=last_update_metrics,
-                    )
+                    finally:
+                        self._close_episode_logging()
 
             except Exception as e:
                 LogUtil.error(e)
             finally:
+                self._close_episode_logging()
+                self._close_tensorboard_writer()
                 self.training_logger.close()
                 time.sleep(2)
 
     def _reset_episode_state(self):
         """重置单轮训练的状态变量。"""
         self.episode_reward_sum = 0.0
+        self.current_episode_step = 0
         self.next_state = None
         self.last_distance = None
         self.done = False
@@ -360,15 +382,29 @@ class PPONav:
             obstacle_idx = int(np.argmin(scan_range))
             obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
 
-        return obstacle_min_range, float(obstacle_idx)
+        return obstacle_min_range, self._scan_feature_index_to_relative_angle(obstacle_idx)
 
     def _target_angle_to_scan_index(self, angle_diff: float, scan_len: int) -> int | None:
         """将目标相对航向角映射到前向180度扫描索引。"""
         if scan_len <= 0:
             return None
-        if angle_diff < -90.0 or angle_diff > 90.0:
+        if angle_diff < -90.0 or angle_diff >= 90.0:
             return None
         raw_index = int(round((angle_diff + 90.0) / 2.0))
+        return max(0, min(scan_len - 1, raw_index))
+
+    @staticmethod
+    def _scan_feature_index_to_relative_angle(index: int | float) -> float:
+        """将重排后的前向雷达特征索引还原为船体系相对角度。"""
+        return float(index) * 2.0 - 90.0
+
+    @staticmethod
+    def _relative_angle_to_scan_feature_index(angle_deg: float, scan_len: int) -> int | None:
+        if scan_len <= 0:
+            return None
+        if angle_deg < -90.0 or angle_deg >= 90.0:
+            return None
+        raw_index = int(round((angle_deg + 90.0) / 2.0))
         return max(0, min(scan_len - 1, raw_index))
 
     def _is_last_waypoint_reached(self, current_distance: float) -> bool:
@@ -435,9 +471,39 @@ class PPONav:
         # 动作到控制量的映射
         adviseRotate, adviseSpeed = self._action_to_control(action, obstacle_min_range, current_distance)
 
+        # 先把控制量写回环境，再等待环境刷新出新观测
+        self.global_data.updateThrottleRudderOutput(
+            adviseSpeed, adviseRotate, heading, self.destPointIndex, current_distance
+        )
+
+        refreshed_laser_scan = self._wait_for_laser_data()
+        if refreshed_laser_scan is None:
+            refreshed_laser_scan = laser_scan
+
+        refreshed_pose_info = self._load_vehicle_pose_info()
+        refreshed_nav_context = self._update_navigation_target(refreshed_pose_info)
+        if refreshed_nav_context is None:
+            refreshed_heading = heading
+            refreshed_distance = shipToNextWPDistance
+            refreshed_degreeAship = degreeAship
+            refreshed_speed = pose.speed
+            refreshed_rotate_speed = pose.rotate_speed
+        else:
+            refreshed_heading = refreshed_pose_info[4]
+            refreshed_speed = refreshed_pose_info[5]
+            refreshed_rotate_speed = refreshed_pose_info[6]
+            refreshed_distance = refreshed_nav_context["shipToNextWPDistance"]
+            refreshed_degreeAship = refreshed_nav_context["degreeAship"]
+
         # 获取新状态
-        pose = self.global_data.scada_data.pose
-        new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship, pose.speed, pose.rotate_speed)
+        new_state = self.getState(
+            refreshed_laser_scan,
+            refreshed_heading,
+            refreshed_distance,
+            refreshed_degreeAship,
+            refreshed_speed,
+            refreshed_rotate_speed,
+        )
 
         # 使用分解函数
         breakdown = compute_reward_breakdown(
@@ -449,17 +515,17 @@ class PPONav:
             done=self.done,
             prev_state=state,
             prev_distance=prev_distance,
-            heading_world=heading,
-            target_heading_world=degreeAship,
             episode_elapsed_time=time.time() - self.episode_start_time,
+            heading_world=refreshed_heading,
+            target_heading_world=refreshed_degreeAship,
             config=self.reward_config,
         )
         reward = breakdown.total_reward
         self._update_apf_debug_view(
             prev_state=state,
             new_state=new_state,
-            heading=heading,
-            target_heading_world=degreeAship,
+            heading=refreshed_heading,
+            target_heading_world=refreshed_degreeAship,
             action=action,
             reward=reward,
         )
@@ -481,7 +547,7 @@ class PPONav:
         return StepResult(
             next_state=np.asarray(new_state),
             reward=reward,
-            current_distance=current_distance,
+            current_distance=refreshed_distance,
             advise_speed=adviseSpeed,
             advise_rotate=adviseRotate,
             advised_heading=heading,
@@ -629,7 +695,7 @@ class PPONav:
                 obstacle_idx = int(np.argmin(laser_points))
                 for idx, beam_range in enumerate(laser_points):
                     # 源代码中的前方180°扇区按2°采样，这里按索引还原角度。
-                    relative_deg = -90.0 + idx * 2.0
+                    relative_deg = self._scan_feature_index_to_relative_angle(idx)
                     point_color = (30, 30, 200) if idx == obstacle_idx else (120, 120, 120)
                     point_radius = 4 if idx == obstacle_idx else 2
                     self._draw_debug_point(
@@ -641,10 +707,13 @@ class PPONav:
                         radius=point_radius,
                     )
 
-                obstacle_angle_idx = float(new_state[-1])
-                obstacle_relative_deg = obstacle_angle_idx * 2.0 - 90.0
-                if 0 <= int(round(obstacle_angle_idx)) < laser_points.size:
-                    obstacle_point_range = float(laser_points[int(round(obstacle_angle_idx))])
+                obstacle_relative_deg = float(new_state[-1])
+                obstacle_angle_idx = self._relative_angle_to_scan_feature_index(
+                    obstacle_relative_deg,
+                    laser_points.size,
+                )
+                if obstacle_angle_idx is not None and 0 <= obstacle_angle_idx < laser_points.size:
+                    obstacle_point_range = float(laser_points[obstacle_angle_idx])
                     self._draw_debug_point(
                         canvas,
                         center,
@@ -660,7 +729,7 @@ class PPONav:
                     )
                     cv2.putText(
                         canvas,
-                        "obstacle_angle",
+                        "nearest_lidar_obstacle",
                         (obstacle_point[0] + 10, obstacle_point[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -674,8 +743,8 @@ class PPONav:
                 f"target_heading_world: {target_world:.2f} deg",
                 f"prev_angle_diff: {prev_state[-4]:.2f} deg",
                 f"curr_angle_diff: {new_state[-4]:.2f} deg",
-                f"obstacle_angle(index): {new_state[-1]:.2f}",
-                f"obstacle_angle(relative): {obstacle_relative_deg:.2f} deg",
+                f"obstacle_angle(relative): {new_state[-1]:.2f} deg",
+                f"obstacle_feature_index: {obstacle_angle_idx}",
                 f"obstacle_min_range: {new_state[-2]:.2f} m",
                 f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
                 f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",
@@ -824,6 +893,8 @@ class PPONav:
             if laser_scan is None:
                 return False
 
+            self._log_episode_snapshot(pose_info, nav_context, laser_scan)
+
             # 4. 执行PPO决策循环
             done = self._ppo_decision_loop(state, episode, step, laser_scan, nav_context)
 
@@ -898,6 +969,84 @@ class PPONav:
             return None
         self.last_laser_scan = laser_scan
         return laser_scan
+
+    def _log_episode_snapshot(self, pose_info: tuple, nav_context: dict, laser_scan: Any):
+        if not self.enable_episode_logging or self.episode_logger is None:
+            return
+        obstacle = self._build_obstacle_snapshot(laser_scan, pose_info[4])
+        target = self._point_to_dict(self.destPoint)
+        ship = {
+            "lng": pose_info[2],
+            "lat": pose_info[3],
+        }
+        laser = list(getattr(laser_scan, "ranges", []) or [])
+        self.episode_logger.log_snapshot(
+            obstacle=obstacle,
+            target=target,
+            ship=ship,
+            laser=laser,
+        )
+
+    def _start_episode_logging(self, episode: int):
+        if not self.enable_episode_logging:
+            return
+        if self.episode_logger is None:
+            self.episode_logger = EpisodeDataLogger(self.episode_log_dir)
+        self.episode_logger.start_episode(episode)
+
+    def _close_episode_logging(self):
+        if self.episode_logger is None:
+            return
+        self.episode_logger.close()
+
+    def _build_obstacle_snapshot(self, laser_scan: Any, heading: float) -> dict:
+        ranges = list(getattr(laser_scan, "ranges", []) or [])
+        if not ranges:
+            return {"lng": None, "lat": None, "distance": None, "angle": None}
+
+        valid_points = []
+        for index, value in enumerate(ranges):
+            if value in (None, float("Inf")):
+                continue
+            if isinstance(value, float) and np.isnan(value):
+                continue
+            if value <= 0 or value > LASER_MAX_RANGE:
+                continue
+            valid_points.append((index, float(value)))
+
+        if not valid_points:
+            return {"lng": None, "lat": None, "distance": None, "angle": None}
+
+        min_index, min_distance = min(valid_points, key=lambda item: item[1])
+        heading_rad = math.radians(heading)
+        angle_increment = self._safe_float(getattr(laser_scan, "angle_increment", 0.0))
+        angle_min = self._safe_float(getattr(laser_scan, "angle_min", 0.0))
+        relative_angle = angle_min + min_index * angle_increment
+        world_angle = heading_rad + relative_angle
+        relative_angle_deg = math.degrees(relative_angle)
+
+        return {
+            "lng": round(min_distance * math.cos(world_angle), 6),
+            "lat": round(min_distance * math.sin(world_angle), 6),
+            "distance": round(min_distance, 6),
+            "angle": round(relative_angle_deg, 6),
+        }
+
+    @staticmethod
+    def _point_to_dict(point: Any) -> dict:
+        if point is None:
+            return {"lng": None, "lat": None}
+        return {
+            "lng": getattr(point, "lng", None),
+            "lat": getattr(point, "lat", None),
+        }
+
+    @staticmethod
+    def _safe_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def _ppo_decision_loop(self, state, episode: int, step: int,
                        laser_scan, nav_context: dict) -> bool:
@@ -982,10 +1131,6 @@ class PPONav:
             episode, step, int(self.episode_reward_sum),
             result.reward, MAX_EPOCH, 2
         )
-        self.global_data.updateThrottleRudderOutput(
-            result.advise_speed, result.advise_rotate, result.advised_heading,
-            nextPointIndex, result.current_distance
-        )
 
     def _log_navigation_result(self, nav_context: dict):
         """记录导航结果日志。"""
@@ -993,6 +1138,25 @@ class PPONav:
             f"航点={self.destPointIndex} 距离={nav_context['shipToNextWPDistance']:.1f}m "
             f"速度=... 转向=..."
         )
+
+    def _log_episode_metrics(self, episode: int):
+        if self.tb_writer is None:
+            return
+        self.tb_writer.log_episode(
+            episode=episode,
+            reward=self.episode_reward_sum,
+            length=self.current_episode_step,
+        )
+
+    def _close_tensorboard_writer(self):
+        if self.tb_writer is None:
+            return
+        try:
+            self.tb_writer.close()
+        except Exception as exc:
+            LogUtil.error(f"关闭TensorBoard writer失败: {exc}")
+        finally:
+            self.tb_writer = None
 
     # ==================== 参数注册 ====================
 

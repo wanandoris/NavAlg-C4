@@ -23,9 +23,10 @@ class RewardConfig:
     n_actions: int = 1
     speed_scale: float = 100.0
     apf_attractive_gain: float = 1.0
-    apf_repulsive_gain: float = 4.0
+    apf_repulsive_gain: float = 1.0
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
+
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
 
@@ -229,6 +230,10 @@ def calc_heading_reward(
     angle_diff: float,
     current_distance: float,
     max_distance: float,
+    obstacle_min_range: float | None = None,
+    obstacle_angle: float | None = None,
+    heading_world: float | None = None,
+    target_heading_world: float | None = None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
@@ -243,11 +248,24 @@ def calc_heading_reward(
             yaw_rewards.append(tr)
         return round(yaw_rewards[action] * 5, 2) * distance_rate
 
+    if obstacle_min_range is not None and obstacle_angle is not None:
+        apf_heading_diff = calc_apf_heading_diff(
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+            obstacle_min_range=obstacle_min_range,
+            obstacle_angle=obstacle_angle,
+            heading_world=heading_world,
+            target_heading_world=target_heading_world,
+            config=config,
+        )
+    else:
+        apf_heading_diff = angle_diff
+
     predicted_angle_diff = _normalize_signed_angle_diff(
-        angle_diff - turn_action * config.angular_velocity_max * config.control_dt
+        apf_heading_diff - turn_action * config.angular_velocity_max * config.control_dt
     )
     heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)
-    return round(heading_reward, 2)
+    return round(heading_reward, 2) * distance_rate
 
 
 def calc_repulsive_potential(
@@ -347,8 +365,7 @@ def calc_apf_heading_diff(
     if rho < rho_0:
         # 斥力大小：k * (1/rho - 1/rho_0) * (1/rho^2)
         force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
-        # 障碍物相对角度（沿用原有映射：0°→正前方？实际代码中 obstacle_angle*2-90）
-        obstacle_relative_deg = float(obstacle_angle) * 2.0 - 90.0
+        obstacle_relative_deg = float(obstacle_angle)
         obstacle_world_deg = heading_world + obstacle_relative_deg
         obstacle_rad = math.radians(obstacle_world_deg)
         # 斥力方向：从障碍物指向船舶（即与障碍物方向相反）
