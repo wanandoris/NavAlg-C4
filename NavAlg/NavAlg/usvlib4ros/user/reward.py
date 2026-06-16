@@ -26,6 +26,8 @@ class RewardConfig:
     apf_repulsive_gain: float = 1.0
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
+    reward_weight_time: float = 0.2          # 时间奖励权重，0表示不使用
+    time_exponent: float = 1.5               # 指数缩放系数（值越大，后期惩罚越重）
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
@@ -36,6 +38,7 @@ class RewardBreakdown:
     distance_reward: float
     heading_reward: float
     obstacle_reward: float
+    time_reward: float
     total_reward: float
 
     distance_raw: float
@@ -93,11 +96,11 @@ def compute_reward_breakdown(
     distance_reward_raw = calc_progress_reward(prev_distance, current_distance)
     if prev_distance is None:
         distance_reward_raw = calc_distance_reward(
-        current_distance=current_distance,
-        prev_distance=prev_distance,
-        max_distance=max_distance,
-        config=config,
-    )
+            current_distance=current_distance,
+            prev_distance=prev_distance,
+            max_distance=max_distance,
+            config=config,
+        )
     heading_reward_raw = calc_apf_heading_reward(
         action=action,
         angle_diff=angle_diff if angle_diff is not None else state[-4],
@@ -115,6 +118,15 @@ def compute_reward_breakdown(
     if current_distance < config.target_slow_range:
         obstacle_reward_raw = config.reward_near_target_bonus
 
+    # ----- 新增：实时时间奖励（指数级） -----
+    time_reward = 0.0
+    if episode_elapsed_time is not None and config.max_episode_time > 0:
+        t_norm = episode_elapsed_time / config.max_episode_time
+        # 指数衰减：从 -1 开始，随时间快速下降
+        time_reward_raw = -math.exp(config.time_exponent * t_norm)
+        time_reward = time_reward_raw * config.reward_weight_time
+    # -------------------------------------
+
     distance_reward = distance_reward_raw * config.reward_weight_distance
     obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
     heading_reward = heading_reward_raw * config.reward_weight_heading
@@ -123,7 +135,8 @@ def compute_reward_breakdown(
         distance_reward
         + obstacle_reward
         + heading_reward
-        + config.step_penalty
+        + time_reward                # 加入时间奖励
+        + config.step_penalty        # 仍保留固定步惩罚
     )
 
     if arrive:
@@ -136,6 +149,7 @@ def compute_reward_breakdown(
         distance_reward=distance_reward,
         heading_reward=heading_reward,
         obstacle_reward=obstacle_reward,
+        time_reward=time_reward,      # 新增
         total_reward=reward,
         distance_raw=distance_reward_raw,
         heading_raw=heading_reward_raw,
