@@ -50,7 +50,7 @@ class EpisodeMetrics:
 class TrainingLogger:
     """轻量训练日志器，同时记录 TensorBoard 和 CSV。"""
 
-    def __init__(self, root_dir: str | Path = "Results", summary_interval: int = 50):
+    def __init__(self, root_dir: str | Path = "Results"):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = Path(root_dir) / f"ppo_nav_{timestamp}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -60,7 +60,6 @@ class TrainingLogger:
         self.plot_dir.mkdir(parents=True, exist_ok=True)
         self.live_plot_enabled = _LIVE_PLOT_ENV and plt is not None
 
-        self.summary_interval = max(1, int(summary_interval))
         self.episode_csv_path = self.run_dir / "episode_metrics.csv"
         self.summary_csv_path = self.run_dir / "summary_metrics.csv"
         self.update_csv_path = self.run_dir / "ppo_update_metrics.csv"
@@ -74,7 +73,6 @@ class TrainingLogger:
         self.total_steps = 0
         self.return_auc = 0.0
         self.first_arrive_episode = None
-        self._window: list[EpisodeMetrics] = []
         self._episode_rows: list[dict[str, Any]] = []
         self._summary_rows: list[dict[str, Any]] = []
         self._update_rows: list[dict[str, Any]] = []
@@ -110,13 +108,13 @@ class TrainingLogger:
         self._write_csv_header(
             self.summary_csv_path,
             [
-                "episode_end",
-                "window_size",
-                "success_rate_window",
-                "collision_rate_window",
-                "avg_episode_time_window",
-                "avg_steps_window",
-                "avg_return_window",
+                "update_step",
+                "buffer_size",
+                "actor_loss",
+                "critic_loss",
+                "total_loss",
+                "entropy",
+                "total_episodes",
                 "success_rate_total",
                 "collision_rate_total",
                 "avg_episode_time_total",
@@ -170,6 +168,41 @@ class TrainingLogger:
         self._update_rows.append(row_dict)
         self._append_csv_row(self.update_csv_path, row)
 
+        summary_row = {
+            "update_step": global_step,
+            "buffer_size": update_metrics.get("buffer_size"),
+            "actor_loss": update_metrics.get("actor_loss"),
+            "critic_loss": update_metrics.get("critic_loss"),
+            "total_loss": update_metrics.get("total_loss"),
+            "entropy": update_metrics.get("entropy"),
+            "total_episodes": self.total_episodes,
+            "success_rate_total": self.arrive_count / self.total_episodes if self.total_episodes else 0.0,
+            "collision_rate_total": self.collision_count / self.total_episodes if self.total_episodes else 0.0,
+            "avg_episode_time_total": self.total_episode_time / self.total_episodes if self.total_episodes else 0.0,
+            "avg_steps_total": self.total_steps / self.total_episodes if self.total_episodes else 0.0,
+            "auc_return": self.return_auc,
+            "first_arrive_episode": self.first_arrive_episode,
+        }
+        self._summary_rows.append(summary_row)
+        self._append_csv_row(
+            self.summary_csv_path,
+            [
+                summary_row["update_step"],
+                summary_row["buffer_size"],
+                summary_row["actor_loss"],
+                summary_row["critic_loss"],
+                summary_row["total_loss"],
+                summary_row["entropy"],
+                summary_row["total_episodes"],
+                summary_row["success_rate_total"],
+                summary_row["collision_rate_total"],
+                summary_row["avg_episode_time_total"],
+                summary_row["avg_steps_total"],
+                summary_row["auc_return"],
+                summary_row["first_arrive_episode"],
+            ],
+        )
+
         if self.writer:
             self.writer.add_scalar("loss/actor", update_metrics["actor_loss"], global_step)
             self.writer.add_scalar("loss/critic", update_metrics["critic_loss"], global_step)
@@ -177,6 +210,7 @@ class TrainingLogger:
             self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
 
         self._plot_update_metrics()
+        self._plot_summary_metrics()
         self._refresh_live_windows()
 
     def log_episode(
@@ -215,7 +249,6 @@ class TrainingLogger:
             auc_return=self.return_auc,
             first_arrive_episode=self.first_arrive_episode,
         )
-        self._window.append(metrics)
 
         total_success_rate = self.arrive_count / self.total_episodes
         total_collision_rate = self.collision_count / self.total_episodes
@@ -277,79 +310,10 @@ class TrainingLogger:
             self.writer.add_scalar("metrics/avg_episode_time_total", total_avg_time, episode)
             self.writer.add_scalar("metrics/avg_steps_total", total_avg_steps, episode)
 
-        if len(self._window) >= self.summary_interval:
-            self._flush_window_summary(episode)
-
         self._plot_episode_metrics()
         return metrics
 
-    def _flush_window_summary(self, episode: int):
-        window = self._window[:]
-        self._window.clear()
-        if not window:
-            return
-
-        window_size = len(window)
-        success_rate_window = sum(int(x.arrived) for x in window) / window_size
-        collision_rate_window = sum(int(x.collided) for x in window) / window_size
-        avg_time_window = sum(x.episode_time_sec for x in window) / window_size
-        avg_steps_window = sum(x.steps for x in window) / window_size
-        avg_return_window = sum(x.episode_return for x in window) / window_size
-
-        total_success_rate = self.arrive_count / self.total_episodes
-        total_collision_rate = self.collision_count / self.total_episodes
-        total_avg_time = self.total_episode_time / self.total_episodes
-        total_avg_steps = self.total_steps / self.total_episodes
-        row_dict = {
-            "episode_end": episode,
-            "window_size": window_size,
-            "success_rate_window": success_rate_window,
-            "collision_rate_window": collision_rate_window,
-            "avg_episode_time_window": avg_time_window,
-            "avg_steps_window": avg_steps_window,
-            "avg_return_window": avg_return_window,
-            "success_rate_total": total_success_rate,
-            "collision_rate_total": total_collision_rate,
-            "avg_episode_time_total": total_avg_time,
-            "avg_steps_total": total_avg_steps,
-            "auc_return": self.return_auc,
-            "first_arrive_episode": self.first_arrive_episode,
-        }
-        self._summary_rows.append(row_dict)
-
-        self._append_csv_row(
-            self.summary_csv_path,
-            [
-                row_dict["episode_end"],
-                row_dict["window_size"],
-                row_dict["success_rate_window"],
-                row_dict["collision_rate_window"],
-                row_dict["avg_episode_time_window"],
-                row_dict["avg_steps_window"],
-                row_dict["avg_return_window"],
-                row_dict["success_rate_total"],
-                row_dict["collision_rate_total"],
-                row_dict["avg_episode_time_total"],
-                row_dict["avg_steps_total"],
-                row_dict["auc_return"],
-                row_dict["first_arrive_episode"],
-            ],
-        )
-
-        if self.writer:
-            self.writer.add_scalar("window50/success_rate", success_rate_window, episode)
-            self.writer.add_scalar("window50/collision_rate", collision_rate_window, episode)
-            self.writer.add_scalar("window50/avg_episode_time", avg_time_window, episode)
-            self.writer.add_scalar("window50/avg_steps", avg_steps_window, episode)
-            self.writer.add_scalar("window50/avg_return", avg_return_window, episode)
-
-        self._plot_summary_metrics()
-        self._refresh_live_windows()
-
     def close(self):
-        if self._window:
-            last_episode = self._window[-1].episode
-            self._flush_window_summary(last_episode)
         self._plot_all()
         self._refresh_live_windows(force_draw=True)
         if self.writer:
@@ -455,28 +419,28 @@ class TrainingLogger:
         if plt is None or not self._summary_rows:
             return
 
-        episodes = [row["episode_end"] for row in self._summary_rows]
+        updates = [row["update_step"] for row in self._summary_rows]
         self._save_multi_line_plot(
-            self.plot_dir / "window50_rates.png",
-            episodes,
+            self.plot_dir / "summary_rates.png",
+            updates,
             [
-                ("Success Rate Window", [row["success_rate_window"] for row in self._summary_rows]),
-                ("Collision Rate Window", [row["collision_rate_window"] for row in self._summary_rows]),
+                ("Success Rate Total", [row["success_rate_total"] for row in self._summary_rows]),
+                ("Collision Rate Total", [row["collision_rate_total"] for row in self._summary_rows]),
             ],
-            "Window Metrics",
-            "Episode",
+            "Summary Metrics",
+            "Update Step",
             "Rate",
         )
         self._save_multi_line_plot(
-            self.plot_dir / "window50_efficiency.png",
-            episodes,
+            self.plot_dir / "summary_efficiency.png",
+            updates,
             [
-                ("Avg Return Window", [row["avg_return_window"] for row in self._summary_rows]),
-                ("Avg Steps Window", [row["avg_steps_window"] for row in self._summary_rows]),
-                ("Avg Time Window", [row["avg_episode_time_window"] for row in self._summary_rows]),
+                ("Avg Episode Time Total", [row["avg_episode_time_total"] for row in self._summary_rows]),
+                ("Avg Steps Total", [row["avg_steps_total"] for row in self._summary_rows]),
+                ("AUC Return", [row["auc_return"] for row in self._summary_rows]),
             ],
-            "Window Efficiency",
-            "Episode",
+            "Summary Efficiency",
+            "Update Step",
             "Value",
         )
 
@@ -621,15 +585,15 @@ class TrainingLogger:
         for ax in axes.flat:
             ax.clear()
 
-        episodes = [row["episode_end"] for row in self._summary_rows]
-        axes[0].plot(episodes, [row["success_rate_window"] for row in self._summary_rows], label="Success")
-        axes[0].plot(episodes, [row["collision_rate_window"] for row in self._summary_rows], label="Collision")
-        axes[0].set_title("Window Rates")
+        updates = [row["update_step"] for row in self._summary_rows]
+        axes[0].plot(updates, [row["success_rate_total"] for row in self._summary_rows], label="Success")
+        axes[0].plot(updates, [row["collision_rate_total"] for row in self._summary_rows], label="Collision")
+        axes[0].set_title("Summary Rates")
         axes[0].legend()
-        axes[1].plot(episodes, [row["avg_return_window"] for row in self._summary_rows], label="Return")
-        axes[1].plot(episodes, [row["avg_steps_window"] for row in self._summary_rows], label="Steps")
-        axes[1].plot(episodes, [row["avg_episode_time_window"] for row in self._summary_rows], label="Time")
-        axes[1].set_title("Window Efficiency")
+        axes[1].plot(updates, [row["avg_episode_time_total"] for row in self._summary_rows], label="Time")
+        axes[1].plot(updates, [row["avg_steps_total"] for row in self._summary_rows], label="Steps")
+        axes[1].plot(updates, [row["auc_return"] for row in self._summary_rows], label="AUC")
+        axes[1].set_title("Summary Efficiency")
         axes[1].legend()
         for ax in axes.flat:
             ax.grid(True, alpha=0.3)

@@ -12,6 +12,7 @@
 *NavAlg/NavAlg/usvlib4ros/usvRosUtil/__pycache__
 *NavAlg/NavAlg/usvlib4ros/user/temp_diff
 *NavAlg/NavAlg/usvlib4ros/user/__pycache__
-
+*NavAlg/NavAlg/config.json
+*runs/
 .venv
 .idea

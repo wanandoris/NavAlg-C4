@@ -113,7 +113,9 @@ class ActorCritic(nn.Module):
 
     def _get_log_std(self, learnable: bool) -> torch.Tensor:
         """在启用前冻结 log_std，首次到达后再允许其参与梯度更新。"""
-        log_std = torch.clamp(self.log_std, min=-2.5, max=0.5)
+        # 连续动作已经有明确的物理边界 [-1, 1]，过大的采样方差会让动作频繁越界，
+        # 再被执行层裁到边界，表现成“长期打满舵”。
+        log_std = torch.clamp(self.log_std, min=-2.0, max=-0.3)
         return log_std if learnable else log_std.detach()
 
     def act(self, state: torch.Tensor):
@@ -242,6 +244,7 @@ class PPO:
         self.mse_loss = nn.MSELoss()   # 用于 Critic 的损失函数
         self.tb_writer = TensorBoardMetricsWriter(writer=writer) if writer is not None else None
         self.update_step = 0
+        self.min_update_buffer_size = 128
 
     @staticmethod
     def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
@@ -275,6 +278,8 @@ class PPO:
     def update(self):
         """使用缓冲区中收集的经验更新策略网络(PPO 核心更新步骤)。"""
         if not self.buffer.rewards:
+            return None
+        if len(self.buffer.rewards) < self.min_update_buffer_size:
             return None
 
         # ========== 1. 将缓冲区中的列表数据转换为张量 ==========

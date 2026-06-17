@@ -7,11 +7,12 @@ class RewardConfig:
     reward_arrive_bonus: float = 1000
     reward_collision_penalty: float = -500
     reward_near_target_bonus: float = 1
-    reward_weight_distance: float = 0.8
-    reward_weight_obstacle: float = 0.4
-    reward_weight_heading: float = 0.4
+    reward_weight_distance: float = 1.8
+    reward_weight_obstacle: float = 1.8
+    reward_weight_heading: float = 1.6
+    reward_weight_time: float = 0.65
     progress_scale: float = 10.0
-    obstacle_safe_range: float = 3.0
+    obstacle_safe_range: float = 6.5
     obstacle_penalty_scale: float = 10.0
     step_penalty: float = -0.01
     max_episode_time: float = 300.0
@@ -22,12 +23,12 @@ class RewardConfig:
     has_continuous_action: bool = True
     n_actions: int = 1
     speed_scale: float = 100.0
-    apf_attractive_gain: float = 1.0
-    apf_repulsive_gain: float = 1.0
+    apf_attractive_gain: float = 0.8
+    apf_repulsive_gain: float = 18.0
     apf_obstacle_influence_range: float = 3.0
     apf_heading_repulsive_weight: float = 1.0
-    reward_weight_time: float = 0.2          # 时间奖励权重，0表示不使用
-    time_exponent: float = 1.5               # 指数缩放系数（值越大，后期惩罚越重）
+    pid_heading_consistency_scale: float = 45.0
+    time_exponent: float = 2.2
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()
@@ -40,7 +41,6 @@ class RewardBreakdown:
     obstacle_reward: float
     time_reward: float
     total_reward: float
-
     distance_raw: float
     heading_raw: float
     obstacle_raw: float
@@ -93,6 +93,7 @@ def compute_reward_breakdown(
     obstacle_min_range = state[-2]
     obstacle_angle = state[-1]
     current_distance = state[-3]
+
     distance_reward_raw = calc_progress_reward(prev_distance, current_distance)
     if prev_distance is None:
         distance_reward_raw = calc_distance_reward(
@@ -101,6 +102,7 @@ def compute_reward_breakdown(
             max_distance=max_distance,
             config=config,
         )
+
     heading_reward_raw = calc_apf_heading_reward(
         action=action,
         angle_diff=angle_diff if angle_diff is not None else state[-4],
@@ -118,14 +120,11 @@ def compute_reward_breakdown(
     if current_distance < config.target_slow_range:
         obstacle_reward_raw = config.reward_near_target_bonus
 
-    # ----- 新增：实时时间奖励（指数级） -----
     time_reward = 0.0
     if episode_elapsed_time is not None and config.max_episode_time > 0:
         t_norm = episode_elapsed_time / config.max_episode_time
-        # 指数衰减：从 -1 开始，随时间快速下降
         time_reward_raw = -math.exp(config.time_exponent * t_norm)
         time_reward = time_reward_raw * config.reward_weight_time
-    # -------------------------------------
 
     distance_reward = distance_reward_raw * config.reward_weight_distance
     obstacle_reward = obstacle_reward_raw * config.reward_weight_obstacle
@@ -135,8 +134,8 @@ def compute_reward_breakdown(
         distance_reward
         + obstacle_reward
         + heading_reward
-        + time_reward                # 加入时间奖励
-        + config.step_penalty        # 仍保留固定步惩罚
+        + time_reward
+        + config.step_penalty
     )
 
     if arrive:
@@ -149,7 +148,7 @@ def compute_reward_breakdown(
         distance_reward=distance_reward,
         heading_reward=heading_reward,
         obstacle_reward=obstacle_reward,
-        time_reward=time_reward,      # 新增
+        time_reward=time_reward,
         total_reward=reward,
         distance_raw=distance_reward_raw,
         heading_raw=heading_reward_raw,
@@ -158,7 +157,6 @@ def compute_reward_breakdown(
 
 
 def _split_action(action: int | float | list | tuple) -> tuple[float, float]:
-    """将动作统一拆成(转向, 速度)两维。"""
     if hasattr(action, "tolist"):
         action = action.tolist()
     if isinstance(action, (list, tuple)):
@@ -178,6 +176,10 @@ def _split_action(action: int | float | list | tuple) -> tuple[float, float]:
     return float(action), 0.0
 
 
+def _clip_turn_action(turn_action: float) -> float:
+    return max(-1.0, min(1.0, float(turn_action)))
+
+
 def calc_distance_reward(
     current_distance: float,
     prev_distance: float | None,
@@ -186,13 +188,10 @@ def calc_distance_reward(
 ) -> float:
     if current_distance <= 1:
         return 0.0
-
     if prev_distance is not None:
         return (prev_distance - current_distance) * config.progress_scale
-
     if max_distance <= 0:
         return 0.0
-
     reward = 1 - (current_distance / max_distance)
     return reward * 2 if reward < 0 else reward * 5
 
@@ -203,7 +202,6 @@ def calc_obstacle_reward(
 ) -> float:
     if obstacle_min_range >= config.obstacle_safe_range:
         return 0.0
-
     danger_ratio = (config.obstacle_safe_range - obstacle_min_range) / config.obstacle_safe_range
     return -(danger_ratio ** 2) * config.obstacle_penalty_scale
 
@@ -214,26 +212,15 @@ def calc_time_reward_weight(
 ) -> float:
     if episode_elapsed_time is None:
         return 1.0
-
     if config.max_episode_time <= 0:
         return 1.0
-
     progress = episode_elapsed_time / config.max_episode_time
     progress = max(0.0, min(1.0, progress))
-
-    return config.min_arrive_time_weight + (
-        1.0 - config.min_arrive_time_weight
-    ) * math.exp(-4 * progress)
+    return config.min_arrive_time_weight + (1.0 - config.min_arrive_time_weight) * math.exp(-4 * progress)
 
 
 def calc_progress_reward(prev_distance: float | None, current_distance: float) -> float:
-    """基于距离变化量的进度奖励。
-
-    前进则为正，远离目标则为负；数值尽量保持小而稳定，避免压过终止奖励。
-    """
-    if prev_distance is None:
-        return 0.0
-    if prev_distance <= 0:
+    if prev_distance is None or prev_distance <= 0:
         return 0.0
     progress = prev_distance - current_distance
     return max(-1.0, min(1.0, progress / prev_distance))
@@ -252,6 +239,7 @@ def calc_heading_reward(
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
     turn_action, _ = _split_action(action)
+    turn_action = _clip_turn_action(turn_action)
 
     if not config.has_continuous_action:
         yaw_rewards = []
@@ -307,6 +295,7 @@ def calc_apf_heading_reward(
 ) -> float:
     distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
     turn_action, _ = _split_action(action)
+    turn_action = _clip_turn_action(turn_action)
 
     if not config.has_continuous_action:
         return calc_heading_reward(
@@ -365,30 +354,24 @@ def calc_apf_heading_diff(
     if target_heading_world is None:
         target_heading_world = heading_world + angle_diff
 
-    # ---------- 引力矢量（与论文公式一致） ----------
     target_rad = math.radians(target_heading_world)
     attractive_strength = config.apf_attractive_gain * max(float(current_distance), 0.0)
     attractive_x = attractive_strength * math.cos(target_rad)
     attractive_y = attractive_strength * math.sin(target_rad)
 
-    # ---------- 斥力矢量（论文梯度公式，而非势能） ----------
     repulsive_x = 0.0
     repulsive_y = 0.0
     rho = max(float(obstacle_min_range), 1e-3)
     rho_0 = config.apf_obstacle_influence_range
     if rho < rho_0:
-        # 斥力大小：k * (1/rho - 1/rho_0) * (1/rho^2)
         force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
         obstacle_relative_deg = float(obstacle_angle)
         obstacle_world_deg = heading_world + obstacle_relative_deg
         obstacle_rad = math.radians(obstacle_world_deg)
-        # 斥力方向：从障碍物指向船舶（即与障碍物方向相反）
-        # 保留原代码的负号，使船舶远离障碍物
         repulsive_strength = force_magnitude * config.apf_heading_repulsive_weight
         repulsive_x = -repulsive_strength * math.cos(obstacle_rad)
         repulsive_y = -repulsive_strength * math.sin(obstacle_rad)
 
-    # ---------- 合力 ----------
     apf_x = attractive_x + repulsive_x
     apf_y = attractive_y + repulsive_y
     if abs(apf_x) < 1e-6 and abs(apf_y) < 1e-6:

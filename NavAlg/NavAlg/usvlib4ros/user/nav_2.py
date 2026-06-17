@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import csv
 import cv2
 
 import numpy as np
@@ -17,6 +16,7 @@ from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constant
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.episode_logging import EpisodeDataLogger
+from usvlib4ros.user.pid_controller import PID, PIDConfig
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown, calc_apf_heading_diff
 from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
@@ -29,36 +29,42 @@ N_STATES = 96          # 状态维度: 前方180°激光点数(约90) + speed + 
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
 LR_ACTOR = 0.0003
-LR_CRITIC = 0.001
-GAMMA = 0.9           # 折扣因子
-K_EPOCHS = 80          # PPO更新轮数
+LR_CRITIC = 0.0001
+GAMMA = 0.99           # 折扣因子
+K_EPOCHS = 20          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
-ACTION_STD_INIT = 0.6  # 连续动作标准差初始化(当前未启用连续空间)
+ACTION_STD_INIT = 1  # 连续动作标准差初始化(当前未启用连续空间)
 MAX_EPOCH = 4000       # 最大训练轮数
-MAX_STEP_PER_EPISODE = 3000   # 每轮最大步数
+MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
-UPDATE_INTERVAL = 2000  # PPO更新间隔(步数)
+UPDATE_INTERVAL = 200  # PPO更新间隔(步数)
+MIN_BUFFER_SIZE_FOR_UPDATE = 128
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 RESET_SETTLE_DELAY = 3.0  # 每轮复位后等待仿真刷新(秒)
+MAX_RESET_RETRIES = 5
+MIXED_ROTATE_CONTROL = False  # 是否启用APF-PID与PPO混合切换
+TEACHER_EPSILON_DECAY = 0.01  # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.05    # 专家概率下限
 
 # ==================== 导航常量 ====================
-LASER_MAX_RANGE = 5.0        # 激光雷达有效最大距离(m)
+LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
 LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
 OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
-ANGULAR_VELOCITY_MAX = 100   # 最大角速度(°/s)
-ACTION_TO_DEGREE_SCALE = 1   # 动作到转向角度的缩放因子
-ACTION_TO_DEGREE_CONTINOUS_SCALE = 100 # 连续动作映射到转向角度缩放因子
+ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
 ACTION_TO_SPEED_CONTINOUS_SCALE = 200 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
-TARGET_ECHO_ANGLE_WINDOW_DEG = 8.0
-TARGET_ECHO_RANGE_MARGIN = 1.0
-TARGET_ECHO_MIN_DISTANCE = 0.5
+PPO_TARGET_HEADING_MAX_OFFSET = 120.0  # PPO目标航向最大偏转角(度)
 ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
+ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
+HEADING_PID_KP = 1.2
+HEADING_PID_KI = 0.02
+HEADING_PID_KD = 0.15
+HEADING_PID_INTEGRAL_LIMIT = 60.0
 
 # ==================== 奖励权重 ====================
 REWARD_ARRIVE_BONUS = 1000      # 到达奖励
@@ -83,6 +89,9 @@ class StepResult:
     degree_aship: float
     obstacle_min_range: float
     obstacle_angle: float
+    ppo_target_heading: float
+    pid_target_heading: float
+    selected_target_heading: float
     breakdown: RewardBreakdown
 
 
@@ -108,13 +117,7 @@ class PPONav:
         self.episode_log_dir = Path.cwd() / "logs"
         self.episode_logger = None
 
-        # 数据收集控制
-        self.data_collection_count = 0
-        self.data_collection_max = 100
-        self.data_collection_enabled = True
-        self.training_logger = TrainingLogger(root_dir="Results", summary_interval=50)
-        self.csv_path = self.training_logger.run_dir / "data_collection.csv"
-        self._init_csv_file()
+        self.training_logger = TrainingLogger(root_dir="Results")
 
         self.last_distance = None
         self.enable_apf_debug_view = ENABLE_APF_DEBUG_VIEW
@@ -157,6 +160,25 @@ class PPONav:
             n_actions=N_ACTIONS,
             max_episode_time=MAX_EPISODE_TIME,
         )
+        self.rotate_control_mode = ROTATE_CONTROL_MODE.upper()
+        self.teacher_prob = 1.0
+        self.teacher_last_selected = False
+        self.heading_pid = PID(
+            PIDConfig(
+                kp=HEADING_PID_KP,
+                ki=HEADING_PID_KI,
+                kd=HEADING_PID_KD,
+                output_limit=ANGULAR_VELOCITY_MAX,
+                integral_limit=HEADING_PID_INTEGRAL_LIMIT,
+            )
+        )
+        self.last_heading_debug = {
+            "ppo_target_heading": 0.0,
+            "pid_target_heading": 0.0,
+            "apf_heading_diff": 0.0,
+            "ppo_heading_diff": 0.0,
+            "selected_target_heading": 0.0,
+        }
 
     # ==================== 训练主循环 ====================
 
@@ -179,15 +201,7 @@ class PPONav:
                         LogUtil.info(f"第 {epoch} 轮训练开始")
                         self._start_episode_logging(epoch)
                         last_update_metrics = None
-
-                        # 复位Unity环境
-                        self.ros_ctrl.reset_unity()
-                        time.sleep(0.1)
-                        while self.global_data.device_data.reset_status != 2:
-                            time.sleep(0.1)
-
-                        time.sleep(RESET_SETTLE_DELAY)
-                        self.ros_ctrl.set_auto_work()
+                        self.teacher_prob = self._calc_teacher_probability(epoch)
 
                         # 加载航线
                         self.route = self.ros_ctrl.getRoute()
@@ -202,6 +216,9 @@ class PPONav:
                         self._reset_episode_state()
                         self.global_data.route = self.route
                         self.__reloadNavigationRoute(self.route)
+                        if not self._reset_and_prepare_episode():
+                            LogUtil.error("多次复位后仍处于碰撞初始状态，跳过当前episode")
+                            continue
 
                         # 本轮导航循环
                         self.episode_start_time = time.time()
@@ -222,7 +239,7 @@ class PPONav:
                             self.done = self.navigationHandler(self.next_state, epoch, step)
 
                             # 定期更新PPO
-                            if step > 0 and step % UPDATE_INTERVAL == 0:
+                            if step > 0 and step % UPDATE_INTERVAL == 0 and self._should_update_ppo():
                                 last_update_metrics = self.ppo_agent.update()
                                 self.training_logger.log_update(
                                     epoch * MAX_STEP_PER_EPISODE + step,
@@ -240,7 +257,7 @@ class PPONav:
                         if not self.done and not self.arrive and self.current_episode_step > 0:
                             self._log_episode_metrics(epoch)
 
-                        if self.ppo_agent.buffer.rewards:
+                        if self._should_update_ppo():
                             last_update_metrics = self.ppo_agent.update()
                             self.training_logger.log_update(
                                 epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
@@ -287,6 +304,14 @@ class PPONav:
         self.destPoint = None
         self.max_distance = 0.0
         self.episode_step_count = 0
+        self.last_heading_debug = {
+            "ppo_target_heading": 0.0,
+            "pid_target_heading": 0.0,
+            "apf_heading_diff": 0.0,
+            "ppo_heading_diff": 0.0,
+            "selected_target_heading": 0.0,
+        }
+        self.heading_pid.reset()
 
     # ==================== 状态获取 ====================
 
@@ -311,8 +336,6 @@ class PPONav:
         scan_range = self._extract_laser_features(scan)
         obstacle_min_range, obstacle_angle = self._extract_obstacle_feature(
             scan_range=scan_range,
-            angle_diff=angle_diff,
-            current_distance=current_distance,
         )
 
         LogUtil.debug(
@@ -353,45 +376,14 @@ class PPONav:
                 scan_range.append(value)
         return scan_range if scan_range else [LASER_MAX_RANGE]
 
-    def _extract_obstacle_feature(
-        self,
-        scan_range: list,
-        angle_diff: float,
-        current_distance: float,
-    ) -> tuple[float, float]:
-        """提取障碍物特征，并尽量排除目标点方向上的回波。"""
+    def _extract_obstacle_feature(self, scan_range: list) -> tuple[float, float]:
+        """提取障碍物特征。"""
         if not scan_range:
             return LASER_MAX_RANGE, 0.0
 
-        filtered_scan = list(scan_range)
-        target_index = self._target_angle_to_scan_index(angle_diff, len(filtered_scan))
-        if target_index is not None and current_distance > TARGET_ECHO_MIN_DISTANCE:
-            window_bins = max(1, int(round(TARGET_ECHO_ANGLE_WINDOW_DEG / 2.0)))
-            start = max(0, target_index - window_bins)
-            end = min(len(filtered_scan), target_index + window_bins + 1)
-            for idx in range(start, end):
-                beam_range = filtered_scan[idx]
-                if abs(beam_range - current_distance) <= TARGET_ECHO_RANGE_MARGIN:
-                    filtered_scan[idx] = LASER_MAX_RANGE
-
-        obstacle_idx = int(np.argmin(filtered_scan))
-        obstacle_min_range = round(float(filtered_scan[obstacle_idx]), 2)
-
-        # 如果整段都被屏蔽掉了，回退到原始最近点，避免状态失真。
-        if obstacle_min_range >= LASER_MAX_RANGE:
-            obstacle_idx = int(np.argmin(scan_range))
-            obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
-
+        obstacle_idx = int(np.argmin(scan_range))
+        obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
         return obstacle_min_range, self._scan_feature_index_to_relative_angle(obstacle_idx)
-
-    def _target_angle_to_scan_index(self, angle_diff: float, scan_len: int) -> int | None:
-        """将目标相对航向角映射到前向180度扫描索引。"""
-        if scan_len <= 0:
-            return None
-        if angle_diff < -90.0 or angle_diff >= 90.0:
-            return None
-        raw_index = int(round((angle_diff + 90.0) / 2.0))
-        return max(0, min(scan_len - 1, raw_index))
 
     @staticmethod
     def _scan_feature_index_to_relative_angle(index: int | float) -> float:
@@ -449,6 +441,108 @@ class PPONav:
         )
         return round(distance * 6378.137 * 1000, 1)
 
+    @staticmethod
+    def _clip(value: float, limit: float) -> float:
+        return max(-limit, min(limit, value))
+
+    @staticmethod
+    def _clip_unit(value: float) -> float:
+        return max(-1.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _calc_teacher_probability(episode: int) -> float:
+        epsilon = math.exp(-TEACHER_EPSILON_DECAY * max(0, episode))
+        return max(TEACHER_EPSILON_MIN, min(1.0, epsilon))
+
+    def _should_update_ppo(self) -> bool:
+        return len(self.ppo_agent.buffer.rewards) >= MIN_BUFFER_SIZE_FOR_UPDATE
+
+    def _reset_and_prepare_episode(self) -> bool:
+        for attempt in range(MAX_RESET_RETRIES):
+            self.ros_ctrl.reset_unity()
+            time.sleep(0.1)
+            while self.global_data.device_data.reset_status != 2:
+                time.sleep(0.1)
+
+            time.sleep(RESET_SETTLE_DELAY)
+            self.ros_ctrl.set_auto_work()
+
+            laser_scan = self._wait_for_laser_data()
+            if laser_scan is None:
+                continue
+            pose_info = self._load_vehicle_pose_info()
+            nav_context = self._update_navigation_target(pose_info)
+            if nav_context is None:
+                continue
+            initial_state = self.getState(
+                laser_scan,
+                pose_info[4],
+                nav_context["shipToNextWPDistance"],
+                nav_context["degreeAship"],
+                pose_info[5],
+                pose_info[6],
+            )
+            obstacle_min_range = initial_state[-2]
+            if obstacle_min_range > COLLISION_DISTANCE:
+                self.next_state = initial_state
+                self.done = False
+                return True
+            LogUtil.info(
+                f"复位后初始障碍过近，跳过本次起点: obstacle_min_range={obstacle_min_range:.2f}, "
+                f"attempt={attempt + 1}/{MAX_RESET_RETRIES}"
+            )
+        return False
+
+    def _compute_apf_target_heading(
+        self,
+        heading: float,
+        target_heading_world: float,
+        current_distance: float,
+        obstacle_min_range: float,
+        obstacle_angle: float,
+        angle_diff: float,
+    ) -> tuple[float, float]:
+        heading_world = self._normalize_heading_360(heading)
+        target_world = self._normalize_heading_360(target_heading_world)
+        apf_heading_diff = calc_apf_heading_diff(
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+            obstacle_min_range=obstacle_min_range,
+            obstacle_angle=obstacle_angle,
+            heading_world=heading_world,
+            target_heading_world=target_world,
+            config=self.reward_config,
+        )
+        apf_target_heading = self._normalize_signed_angle_diff(heading + apf_heading_diff)
+        return apf_target_heading, apf_heading_diff
+
+    def _compute_ppo_target_heading(
+        self,
+        heading: float,
+        turn_ratio: float,
+        target_heading_world: float,
+        current_distance: float,
+        obstacle_min_range: float,
+        obstacle_angle: float,
+        angle_diff: float,
+    ) -> tuple[float, float]:
+        heading_world = self._normalize_heading_360(heading)
+        apf_heading_diff = calc_apf_heading_diff(
+            angle_diff=angle_diff,
+            current_distance=current_distance,
+            obstacle_min_range=obstacle_min_range,
+            obstacle_angle=obstacle_angle,
+            heading_world=heading_world,
+            target_heading_world=self._normalize_heading_360(target_heading_world),
+            config=self.reward_config,
+        )
+        ppo_heading_diff = self._clip(turn_ratio, 1.0) * PPO_TARGET_HEADING_MAX_OFFSET
+        ppo_target_heading = self._normalize_signed_angle_diff(heading + ppo_heading_diff)
+        return ppo_target_heading, ppo_heading_diff
+
+    def _pid_output_to_rudder_percent(self, pid_output: float) -> float:
+        return round(self._clip(pid_output, ANGULAR_VELOCITY_MAX), 0)
+
     def step(self, state: list, action: np.ndarray, laser_scan, heading: float,
              shipToNextWPDistance: float,degreeAship: float, max_distance: float,prev_distance: float) -> StepResult:
         """
@@ -469,7 +563,14 @@ class PPONav:
         current_distance = state[-3]
 
         # 动作到控制量的映射
-        adviseRotate, adviseSpeed = self._action_to_control(action, obstacle_min_range, current_distance)
+        adviseRotate, adviseSpeed = self._action_to_control(
+            action,
+            obstacle_min_range,
+            current_distance,
+            heading,
+            degreeAship,
+            state,
+        )
 
         # 先把控制量写回环境，再等待环境刷新出新观测
         self.global_data.updateThrottleRudderOutput(
@@ -529,16 +630,7 @@ class PPONav:
             action=action,
             reward=reward,
         )
-
-        # reward = compute_reward(
-        #     state=new_state,
-        #     action=action,
-        #     max_distance=max_distance,
-        #     angle_diff=new_state[-4],
-        #     arrive=self.arrive,
-        #     done=self.done,
-        #     config=self.reward_config,
-        # )
+        
         if self.arrive:
             LogUtil.info("到达目标!")
         elif self.done:
@@ -555,21 +647,55 @@ class PPONav:
             degree_aship=degreeAship,
             obstacle_min_range=state[-2],
             obstacle_angle=state[-1],
+            ppo_target_heading=self.last_heading_debug["ppo_target_heading"],
+            pid_target_heading=self.last_heading_debug["pid_target_heading"],
+            selected_target_heading=self.last_heading_debug["selected_target_heading"],
             breakdown=breakdown,
         )
 
     def _action_to_control(self, action: np.ndarray, obstacle_min_range: float,
-                           current_distance: float) -> tuple:
+                           current_distance: float, heading: float,
+                           target_heading_world: float, state: list) -> tuple:
         if HAS_CONTINUOUS_ACTION:
-            """将连续动作直接映射为转向百分比"""
-            # 映射到实际角速度(度/秒)
+            """根据模式选择目标航向,再统一交给PID输出舵量。"""
             action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
             if action_vec.size < 2:
                 raise ValueError(f"continuous action must have at least 2 elements, got shape={np.asarray(action).shape}")
-            turn_ratio = float(action_vec[0])
-            speed_ratio = float(action_vec[1])
-            ang_vel = turn_ratio * ANGULAR_VELOCITY_MAX
-            adviseRotate = round(ang_vel, 0)
+            turn_ratio = self._clip_unit(action_vec[0])
+            speed_ratio = self._clip_unit(action_vec[1])
+            apf_target_heading, apf_heading_diff = self._compute_apf_target_heading(
+                heading=heading,
+                target_heading_world=target_heading_world,
+                current_distance=current_distance,
+                obstacle_min_range=obstacle_min_range,
+                obstacle_angle=state[-1],
+                angle_diff=state[-4],
+            )
+            ppo_target_heading, ppo_heading_diff = self._compute_ppo_target_heading(
+                heading=heading,
+                turn_ratio=turn_ratio,
+                target_heading_world=target_heading_world,
+                current_distance=current_distance,
+                obstacle_min_range=obstacle_min_range,
+                obstacle_angle=state[-1],
+                angle_diff=state[-4],
+            )
+            use_teacher = False
+            if MIXED_ROTATE_CONTROL:
+                use_teacher = np.random.rand() < self.teacher_prob
+            elif self.rotate_control_mode == "PID":
+                use_teacher = True
+            self.teacher_last_selected = use_teacher
+            selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
+            heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
+            adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
+            self.last_heading_debug = {
+                "ppo_target_heading": float(ppo_target_heading),
+                "pid_target_heading": float(apf_target_heading),
+                "apf_heading_diff": float(apf_heading_diff),
+                "ppo_heading_diff": float(ppo_heading_diff),
+                "selected_target_heading": float(selected_target_heading),
+            }
 
             # 自适应速度
             adviseSpeed = speed_ratio * ACTION_TO_SPEED_CONTINOUS_SCALE
@@ -583,17 +709,44 @@ class PPONav:
                 adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.3)
 
         else:
-            """将离散动作映射为(转向百分比, 速度百分比)。"""
-            # 角度计算：将action映射到[-100, +100]度范围
+            """将离散动作映射为目标航向后再交给PID。"""
             ang_vel = ((self.action_size - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((self.action_size - 1) / 2)
-            adviseRotate = round(ang_vel, 0) * ACTION_TO_DEGREE_CONTINOUS_SCALE
-             # 自适应速度
+            # 自适应速度
             adviseSpeed = DEFAULT_SPEED
             if obstacle_min_range < OBSTACLE_SLOW_RANGE:
                 adviseSpeed = 0.1
             if current_distance < TARGET_SLOW_RANGE:
                 adviseSpeed = 0.1
             adviseSpeed = min(round(adviseSpeed * 100 / DEFAULT_SPEED, 0), 100)
+            apf_target_heading, apf_heading_diff = self._compute_apf_target_heading(
+                heading=heading,
+                target_heading_world=target_heading_world,
+                current_distance=current_distance,
+                obstacle_min_range=obstacle_min_range,
+                obstacle_angle=state[-1],
+                angle_diff=state[-4],
+            )
+            ppo_target_heading, ppo_heading_diff = self._compute_ppo_target_heading(
+                heading=heading,
+                turn_ratio=self._clip_unit(ang_vel / ANGULAR_VELOCITY_MAX),
+                target_heading_world=target_heading_world,
+                current_distance=current_distance,
+                obstacle_min_range=obstacle_min_range,
+                obstacle_angle=state[-1],
+                angle_diff=state[-4],
+            )
+            use_teacher = self.rotate_control_mode == "PID"
+            self.teacher_last_selected = use_teacher
+            selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
+            heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
+            adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
+            self.last_heading_debug = {
+                "ppo_target_heading": float(ppo_target_heading),
+                "pid_target_heading": float(apf_target_heading),
+                "apf_heading_diff": float(apf_heading_diff),
+                "ppo_heading_diff": float(ppo_heading_diff),
+                "selected_target_heading": float(selected_target_heading),
+            }
 
         return adviseRotate, adviseSpeed
 
@@ -676,7 +829,7 @@ class PPONav:
             action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
             turn_action = float(action_vec[0]) if action_vec.size > 0 else 0.0
             predicted_apf_heading_diff = self._normalize_signed_angle_diff(
-                curr_apf_heading_diff - turn_action * ANGULAR_VELOCITY_MAX * CONTROL_DT
+                curr_apf_heading_diff - turn_action * 100 * CONTROL_DT
             )
 
             canvas = np.full((720, 760, 3), 248, dtype=np.uint8)
@@ -686,8 +839,11 @@ class PPONav:
 
             self._draw_debug_arrow(canvas, center, 130, heading_world, (50, 50, 50), "ship")
             self._draw_debug_arrow(canvas, center, 180, target_world, (40, 160, 40), "target")
+            self._draw_debug_arrow(canvas, center, 195, self._normalize_heading_360(self.last_heading_debug["ppo_target_heading"]), (180, 120, 40), "ppo_pred")
+            self._draw_debug_arrow(canvas, center, 215, self._normalize_heading_360(self.last_heading_debug["pid_target_heading"]), (0, 150, 150), "apf_pred")
+            self._draw_debug_arrow(canvas, center, 235, self._normalize_heading_360(self.last_heading_debug["selected_target_heading"]), (120, 60, 180), "selected")
             self._draw_debug_arrow(canvas, center, 220, heading_world + curr_apf_heading_diff, (30, 80, 220), "apf_now")
-            self._draw_debug_arrow(canvas, center, 150, heading_world + predicted_apf_heading_diff, (180, 60, 180), "apf_pred")
+            self._draw_debug_arrow(canvas, center, 150, heading_world + predicted_apf_heading_diff, (180, 60, 180), "apf_next")
 
             laser_count = max(0, len(new_state) - 6)
             laser_points = np.asarray(new_state[:laser_count], dtype=np.float32)
@@ -749,8 +905,12 @@ class PPONav:
                 f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
                 f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",
                 f"pred_apf_heading_diff: {predicted_apf_heading_diff:.2f} deg",
+                f"teacher_prob: {self.teacher_prob:.3f}",
+                f"teacher_selected: {int(self.teacher_last_selected)}",
                 f"laser_points: {laser_count}",
                 f"turn_action: {turn_action:.3f}",
+                f"ppo_heading_diff: {self.last_heading_debug['ppo_heading_diff']:.2f}",
+                f"selected_target: {self.last_heading_debug['selected_target_heading']:.2f}",
                 f"reward: {reward:.3f}",
             ]
             for idx, line in enumerate(debug_lines):
@@ -1082,35 +1242,28 @@ class PPONav:
         self.ppo_agent.buffer.is_terminals.append(self.done)
         self.episode_reward_sum += result.reward
 
-        # ---------- 数据收集 CSV ----------
-        if self.data_collection_enabled and self.data_collection_count < self.data_collection_max:
-            done_flag = self.done or self.arrive
-            with open(self.csv_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    result.distance,
-                    result.degree_aship,
-                    result.obstacle_min_range,
-                    result.obstacle_angle,
-                    result.breakdown.distance_raw,
-                    result.breakdown.heading_raw,
-                    result.breakdown.obstacle_raw,
-                    result.reward,
-                    int(done_flag)
-                ])
-            self.data_collection_count += 1
-            if self.data_collection_count >= self.data_collection_max:
-                LogUtil.info(f"数据收集完成，已保存 {self.data_collection_count} 条记录至 {self.csv_path}")
-                self.data_collection_enabled = False
-        # ---------------------------------
+        if self.tb_writer is not None:
+            if self.rotate_control_mode == "PPO":
+                self.tb_writer.add_scalar("heading/ppo_target", result.ppo_target_heading, self.current_episode_step)
+            self.tb_writer.add_scalar("heading/apf_target", result.pid_target_heading, self.current_episode_step)
+            self.tb_writer.add_scalar("heading/selected_target", result.selected_target_heading, self.current_episode_step)
+            self.tb_writer.flush()
 
         # 输出控制量（修复点：补全参数）
         self._output_control_commands(result, episode, step, nav_context['nextPointIndex'])
 
-        LogUtil.debug(
-            f"Step={step} Action={action} Reward={result.reward:.2f} "
-            f"Done={self.done} Arrive={self.arrive}"
-        )
+        if self.rotate_control_mode == "PID":
+            LogUtil.debug(
+                f"Step={step} Action={action} Reward={result.reward:.2f} "
+                f"Rudder={result.advise_rotate:.1f} "
+                f"Done={self.done} Arrive={self.arrive}"
+            )
+        else:
+            LogUtil.debug(
+                f"Step={step} Action={action} Reward={result.reward:.2f} "
+                f"Rudder={result.advise_rotate:.1f} "
+                f"Done={self.done} Arrive={self.arrive}"
+            )
 
         if self.done:
             return True
@@ -1203,18 +1356,6 @@ class PPONav:
                 return None
         return self.global_data.laser_data
     
-    # =================== CSV工具 ====================
-
-    def _init_csv_file(self):
-        if not self.csv_path.exists():
-            with open(self.csv_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "distance", "degreeAship", "obstacle_min_range", "obstacle_angle",
-                    "distance_reward_raw", "heading_reward_raw", "obstacle_reward_raw",
-                    "total_reward", "done"
-                ])
-
     def close(self):
         if getattr(self, "enable_apf_debug_view", False):
             cv2.destroyAllWindows()
