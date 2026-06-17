@@ -1,262 +1,336 @@
-# usvlib4ros2 运行指南
+# C4 流程说明
+这份**README**重点是介绍目前整个仿真工作流程：
 
-> 本文档面向测试人员，说明如何运行 `main.py` 连接仿真平台
+## 1. 当前流程总览
+### 1.1 智能体
+目前的智能体有一个**<font style="background-color:#FBDE28;">96</font>**维的离散状态空间，由：
 
----
+**90长的雷达数组 + 速度 + 角速度 + 与目标角度差 + 与目标点距离 + 与最近障碍物的距离 + 与最近障碍物的夹角  
+**有一个2维的连续动作空间，由：  
+第一维：**预期转角**  
+第二维：**预期速度**
 
-## 一、环境要求
+****
 
-### 1.1 软件环境
+这两个输出值里，预期转角会被`**PID**`映射为应转的角速度量，这个量可能很大。  
+而预期速度会被`ACTION_TO_SPEED_CONTINOUS_SCAL`，缩放到正常比例，但是这个速度值没那么重要，可以先不管。
 
-| 组件 | 版本要求 | 说明 |
-|------|---------|------|
-| Python | 3.10+ | 建议使用 Anaconda/Miniconda 管理环境 |
-| roslibpy | 1.x | 连接 ROS2 的 Python 库 |
-| 其他依赖 | 见 `requirements.txt` | numpy, torch 等 |
+### 1.2 训练流程
+目前的训练流程，采取`apf-pid`和`ppo`切换的形式。  
+`apf_pred`是基于**人工势场法**计算出的预期角度方向，其兼顾了目标的吸引作用与障碍物的排斥作用，具体实现方式可见`docs/PPO_APF.md`，在其提供的帮助下，可以使得船几乎正确的移动（可以通过在`nav_2.cpp`中将`**ENABLE_APF_DEBUG_VIEW**`设为`True`以验证准确性），而每一个`step`中，`ppo`的策略会同样选出一个角度作为`ppo_pred`供船转向。
 
-### 1.2 前置条件
+在初期，`ppo_pred`的探索性会使得成功率过低，而我们借助一个ε因子来丰富样本池，其计算方式如下:
 
-运行 `main.py` 前需确保以下环境已就绪：
+$ \epsilon =max(\epsilon_{min}, e^{-k·max(0,episode)}) $
 
-1. **Ubuntu VM 已启动**并运行 ros2-image 容器
-2. **EmboUnity.exe 已启动**并进入场景
-3. **MATLAB Simulink 模型已点击运行**
-4. **ROSbridge 服务**监听端口 9090
+也就是说，在初期，`**PID**`会近乎百分百的采取`apf_pred`，使得初期`**PPO**`可以获得足够多的成功样本而不是盲目撞墙，随后$ \epsilon $会随时间衰减到$ \epsilon_{min} $,届时策略将完全由`PPO`主导。
 
-### 1.3 项目目录说明
+<img src="https://cdn.nlark.com/yuque/0/2026/png/60743459/1781714608073-79bd20a6-0a89-4ec6-8ac4-2ef637f78ca7.png?x-oss-process=image%2Fcrop%2Cx_0%2Cy_0%2Cw_982%2Ch_297" width="524" title="apf-pid主导下的初期成功率" crop="0,0,0.9704,1" id="ucec51c2c" class="ne-image">
 
-本文档使用 `{项目根目录}` 表示 usvlib4ros2 项目的位置，**请根据实际情况替换**。
 
-> **示例**：
-> - 您的项目目录：`D:\MyProject\usvlib4ros2`
-> - 配置文件：`{项目根目录}\usvlib4ros\main.py` → `D:\MyProject\usvlib4ros2\usvlib4ros\main.py`
-> - 依赖文件：`{项目根目录}\requirements.txt` → `D:\MyProject\usvlib4ros2\requirements.txt`
 
----
+既然你看到了这里，那么允许你去`nav_2.cpp`里把`ROTATE_CONTROL_MODE`改成`PID`，跑跑仿真爽一把😋
 
-## 二、快速开始
+### 1.3 奖励设置
+1. 当前总 reward 主要由以下几部分组成：
+2. `distance_reward`
+3. `heading_reward`
+4. `obstacle_reward`
+5. `time_reward`
+6. `step_penalty`
+7. `arrive_bonus / collision_penalty`
 
-### 2.1 安装依赖
+#### 1.3.1 distance_reward
+当前的 `distance_reward` 由两部分组合出来的：
 
-```bash
-# 进入项目根目录（请根据实际情况替换）
-cd {项目根目录}
++ `progress_reward`
++ `proximity_reward`
 
-# 创建虚拟环境（推荐）
-conda create -n usvtest python=3.10
-conda activate usvtest
+其中：
 
-# 安装依赖
-pip install -r requirements.txt
++ `progress_reward` 奖励“相较于上一步，当前是否更接近目标”,其作为一个进度项，可视为：
+
+$ progress = prev\ distance - current\ distance $
+
++ `proximity_reward` 奖励“当前本身是否已经比较接近目标”,其作为一个非线性的接近项，当前采用类似吸引势场的指数形式，距离越近值越大(但不会大过`arrive_bonus`，权重也不高，防止刷分)
+
+$ proximity= exp\{-k\frac{current \ distance}{distance \ scale}\} $
+
+`distance scale`一般取本轮中距离目标点的最远距离。
+
+#### 1.3.2 heading_reward
+`heading_reward`计算的是当前航向距上文介绍的`apf_pred`的插值，`apf_pred`的计算过程可以看作**目标引力**和**障碍物斥力**两力进行合成后的结果，并且会在引力和斥力前分别乘上`apf_attractive_gain`  
+   ` apf_repulsive_gain`作大小调整
+
+#### 1.3.3 obstacle_reward
+`obstacle_reward` 本质上是一个斥力场惩罚项。其计算方式同样与`docs/PPO_APF.md`相同。
+
+#### 1.3.4 time_reward
+$ w(t) = w_{\min} + (1 - w_{\min}) \exp\left(-4 \cdot \operatorname{clip}\left(\frac{t}{T_{\max}}, 0, 1\right)\right) $
+
+随着时间增大，该惩罚会指数级增大。
+
+#### 1.3.5 其它
+还有几个非常直接的终止项：
+
++ `step_penalty`  
+每一步都会额外扣一点，防止智能体无意义拖时间
++ `reward_arrive_bonus`  
+成功到达目标时给一个明确的大正奖励，但是原先的1000会使得我们设置的奖励都太稀疏了，我改成80
++ `reward_collision_penalty`  
+碰撞时给一个明确的负奖励，同样的问题，我改成-50
+
+
+
+## 2. 训练结果查看
+每次训练都会新建一个结果目录，例如：
+
++ `Results/ppo_nav_20260617_230722/`
+
+这个目录保存的是一次完整实验的记录。
+
+### 2.1 `episode_metrics.csv`
+这个文件按 episode 记录，也就是每一轮训练一行。
+
+比较重要的列包括：
+
++ `episode_return`  
+这一轮的总 reward，是最直观的单轮表现指标
++ `steps`  
+这一轮总共跑了多少步
++ `episode_time_sec`  
+这一轮总耗时
++ `arrived`  
+是否成功到达目标
++ `collided`  
+是否碰撞
++ `timeout`  
+是否因为超时结束
++ `success_rate_total`  
+截止当前 episode 的累计成功率
++ `collision_rate_total`  
+截止当前 episode 的累计碰撞率
++ `avg_episode_time_total`  
+截止当前的平均单轮耗时
++ `avg_steps_total`  
+截止当前的平均步数
+
+### 2.2 `summary_metrics.csv`
+这个文件按 PPO update 记录，也就是每次策略更新为一行。
+
+比较重要的列包括：
+
++ `update_step`  
+当前是第几次 PPO 更新
++ `buffer_size`  
+这次更新用了多少样本
++ `actor_loss`  
+当前 actor 的 loss
++ `critic_loss`  
+当前 critic 的 loss
++ `total_loss`  
+当前总 loss
++ `entropy`  
+当前策略熵
++ `total_episodes`  
+到这次更新为止，总共已经跑了多少轮
++ `success_rate_total`  
+累计成功率
++ `collision_rate_total`  
+累计碰撞率
++ `avg_episode_time_total`  
+累计平均单轮耗时
++ `avg_steps_total`  
+累计平均步数
++ `auc_return`  
+累计回报面积，可以粗略理解为训练期间总体收益的累计表现
++ `first_arrive_episode`  
+第一次成功到达目标出现在第几轮
+
+### 2.3 `ppo_update_metrics.csv`
+这个文件聚焦 PPO 本身的更新情况。
+
+主要看这些列：
+
++ `actor_loss`
++ `critic_loss`
++ `total_loss`
++ `entropy`
++ `buffer_size`
+
+### 2.4 `checkpoints/`
+这里保存的是周期导出的模型权重，例如：
+
++ `PPO_ship_obstacle_0.pth`
++ `PPO_ship_obstacle_100.pth`
+
+它们的主要用途是：
+
++ 保存实验过程中的中间策略
++ 回头比较不同阶段的模型效果
++ 后续单独加载某个 checkpoint 做验证
+
+### 2.5 TensorBoard 日志
+除了 `Results/` 中的 csv 和图片外，TensorBoard 日志也会同步写到：
+
++ `runs/ppo_nav_时间戳/`
+
+如果要开 TensorBoard，可以直接运行：
+
+```powershell
+tensorboard --logdir d:\C4\runs
 ```
 
-> **提示**：如果项目目录包含中文或特殊字符，建议使用英文目录名。
+TensorBoard 更适合实时观察训练过程，尤其适合边训练边看：
 
-### 2.2 运行 main.py
++ reward 曲线
++ success / collision 曲线
++ actor / critic loss
++ entropy
++ heading 相关指标
 
-```bash
-# 方法1：直接运行（使用默认配置）
-python {项目根目录}/usvlib4ros/main.py
+## 3. 调参
+下面只提供需要/有必要调的参数
 
-# 方法2：指定配置
-python {项目根目录}/usvlib4ros/main.py --host 192.168.213.132 --device-id ID_09e4063515d81b2f7352e15bdd53294ace675e96
+### 3.1 PPO相关
+```python
+N_STATES = 96          # 状态维度: 前方180°激光点数(约90) + speed + rotated_speed + angel_diff + distance + obstacle_min_range + obstacle_angle
+LR_ACTOR = 0.00003     # PPO中神经网络学习率，越大越容易过拟合，PPO原论文中ACTOR和CRITIC均为3*10-4j
+LR_CRITIC = 0.0001
+GAMMA = 0.99           # 折扣因子
+K_EPOCHS = 8           # PPO更新轮数(我测这个还算不错)
+ACTION_STD_INIT = 0.5  # 连续动作标准差初始化(越大初始探索性越强)
+UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
+MIN_BUFFER_SIZE_FOR_UPDATE = 256
+MIXED_ROTATE_CONTROL = True  	# 是否启用APF-PID与PPO混合切换
+TEACHER_EPSILON_DECAY = 0.008   # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.20      # 专家概率下限
 ```
 
----
+我还没有尝试过的:
 
-## 三、配置说明
-
-### 3.1 参数配置
-
-在 `main.py` 的 `USVNavMain.start()` 调用中修改参数：
++ 90维的雷达数组可能占据过多状态空间大小，你可以试着在`_extract_laser_features`函数中尝试将
 
 ```python
-USVNavMain.start(
-    host="192.168.213.132",      # 虚拟机IP地址
-    port=9090,                     # rosbridge端口（固定不变）
-    deviceId="ID_09e4063515d81b2f7352e15bdd53294ace675e96",  # 设备唯一标识
-    enable_debug=True,             # 是否启用调试输出
-    laser_debug_freq=0.5,          # 激光雷达打印频率（Hz）
-    device_debug_freq=1.0,         # 设备状态打印频率（Hz）
-    control_debug_freq=2.0         # 控制指令打印频率（Hz）
-)
+for i in range(0, min(len(reordered_ranges), 180), 2):
 ```
 
-### 3.2 参数说明
+替换为4个一取，使雷达数据只有45维，我感觉在可视化中45维还算密集
 
-| 参数 | 说明 | 默认值 | 示例 |
-|------|------|--------|------|
-| `host` | Ubuntu 虚拟机 IP 地址 | 必须配置 | `"192.168.213.132"` |
-| `port` | rosbridge WebSocket 端口 | `9090` | `9090` |
-| `deviceId` | EmboUnity 中智能体的唯一标识 | 必须配置 | `"ID_09e4063515d81b2f7352e15bdd53294ace675e96"` |
-| `enable_debug` | 是否输出调试日志 | `True` | `True` / `False` |
-| `laser_debug_freq` | 激光雷达日志打印频率 | `0.5` Hz | `0.5` = 每2秒打印一次 |
-| `device_debug_freq` | 设备状态日志打印频率 | `1.0` Hz | `1.0` = 每秒打印一次 |
-| `control_debug_freq` | 控制指令日志打印频率 | `2.0` Hz | `2.0` = 每0.5秒打印一次 |
-
-### 3.3 如何获取配置值
-
-#### 获取虚拟机 IP
-
-在 Ubuntu VM 终端执行：
-
-```bash
-hostname -I
+### 3.2 Reward 相关
+```python
+REWARD_ARRIVE_BONUS = 80	   # 到达奖励
+REWARD_COLLISION_PENALTY = -50 # 碰撞惩罚
+REWARD_WEIGHT_DISTANCE = 2.4   # 距离权重
+REWARD_WEIGHT_OBSTACLE = 0.9   # 障碍物权重
+REWARD_WEIGHT_HEADING = 1.0    # 朝向权重
+REWARD_WEIGHT_TIME = 0.2       # 时间权重
+REWARD_PROGRESS_WEIGHT = 0.7   # 进步权重（在distance中）
+REWARD_PROXIMITY_WEIGHT = 0.3  # 接近权重（在distance中）
+REWARD_PROXIMITY_EXPONENT = 2.4 			# 接近权重指数k值（e^kx）			
+REWARD_STEP_PENALTY = -0.005				# 步数小惩罚
+REWARD_MIN_ARRIVE_TIME_WEIGHT = 0.35		# 控制arrive_bonus大小，到达的越早拿的越多，越晚不会低于REWARD_MIN_ARRIVE_TIME_WEIGH
+REWARD_APF_ATTRACTIVE_GAIN = 1.0			# 引力缩放系数
+REWARD_APF_REPULSIVE_GAIN = 8.0				# 斥力缩放系数
+REWARD_APF_OBSTACLE_INFLUENCE_RANGE = 2.5	# APF开始考虑障碍物斥力的距离
+REWARD_TIME_EXPONENT = 1.4					#  时间权重指数k值（e^kx）
 ```
 
-或
+如果有好的想法，你也可以按照上面奖励里公式的介绍去改公式
 
-```bash
-ip addr show
+### 3.3 导航/PID相关
+```python
+LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
+COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
+ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
+DEFAULT_SPEED = 1.0          # 默认速度(m/s)
+OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
+TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
+ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
+PPO_TARGET_HEADING_MAX_OFFSET = 90.0  # PPO目标航向最大偏转角(度)
+ACTION_TO_SPEED_CONTINOUS_SCALE = 120 # 连续动作映射到速度缩放因子
+CONTROL_DT = 0.01            # 控制周期(s),用于连续动作
+ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
+HEADING_PID_KP = 1.2
+HEADING_PID_KI = 0.02
+HEADING_PID_KD = 0.15
+HEADING_PID_INTEGRAL_LIMIT = 60.0
 ```
 
-输出示例：`192.168.213.132`
 
-#### 获取 deviceId
 
-1. 启动 EmboUnity.exe
-2. 登录后选择智能体，deviceId 会显示在界面或配置文件中
-3. 示例值：`ID_09e4063515d81b2f7352e15bdd53294ace675e96`
-
----
-
-## 四、运行示例
-
-### 4.1 正常启动输出
-
-成功连接后，终端应显示：
-
-```
-[Main] USV Navigation Service started with debug logging enabled.
-[Main] Press Ctrl+C to stop.
-
-[ROS Debug] Connected to rosbridge at 192.168.213.132:9090
-[ROS DEBUG] [激光雷达数据] Topic: usv/ID_xxx/laser/scan, angle_min: -3.14 ...
-[ROS DEBUG] [设备状态] latitude: 30.xxxx, longitude: 120.xxxx, heading: 45.5°
-[ROS DEBUG] [控制指令] linear.x: 0.5, angular.z: 0.0
+### 3.4 其它
+```python
+# ==================== 其它 ====================
+MAX_EPOCH = 4000       # 最大训练轮数
+MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
+MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
+CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
+ENABLE_APF_DEBUG_VIEW = False         # 是否打开APF方向实时调试窗口
+APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 ```
 
-### 4.2 常见错误及处理
+### 3.5 PPO 结构改动
+如果你想改的是算法本身就去看PPO  
+我常改的有：`std_log`的clamp，`ActorCritic`网络结构（其实只是加过一次`nn.LayerNorm(hidden_dim)`层，效果要是不好可以试着回滚版本补回原来官方示例的那样)
 
-| 错误信息 | 可能原因 | 解决方法 |
-|---------|---------|---------|
-| `Connection refused` | VM 未启动或 rosbridge 未运行 | 检查 VM 状态，确认 ros2-image 容器运行 |
-| `Timeout error` | 网络不通或防火墙拦截 | 检查宿主机与 VM 网络连接，关闭防火墙 |
-| `Invalid deviceId` | deviceId 与 EmboUnity 中不匹配 | 确认 deviceId 大小写正确 |
-| `No data received` | EmboUnity 未启动或未进入场景 | 确认 EmboUnity 已启动并选择智能体 |
+### 3.6 时间刻
+现在还有一个比较棘手的地方，就是按我现在的更新策略（既要有效batch够大，每个episode质量不能太低），大概跑了380个回合，成功`update`150次也并无效果。我问孟哥如果希望算法见效，估计要跑几千次`update`
 
----
-
-## 五、调试功能
-
-### 5.1 关闭调试输出
-
-如不需要频繁的日志输出，可关闭调试：
+但是我和我朋友都感觉就这个破环境部署到服务器租显卡有点难度。如果大家希望见效快一点，可以选择开小图加快仿真时间刻，具体需改动：
 
 ```python
-USVNavMain.start(
-    host="192.168.213.132",
-    port=9090,
-    deviceId="ID_xxx",
-    enable_debug=False      # 关闭调试输出
-)
+# ==================== 时间刻 ====================
+TASK_WAIT_SLEEP = 0.01          # 等待训练触发轮询间隔(秒)
+EMPTY_ROUTE_SLEEP = 0.01        # 航线为空时的等待间隔(秒)
+STEP_SLEEP = 0.01               # 每步主循环结束等待间隔(秒)
+FINAL_SLEEP = 0.2               # 异常/结束后的等待间隔(秒)
+RESET_START_SLEEP = 0.01        # reset_unity后首次等待(秒)
+RESET_STATUS_SLEEP = 0.01       # 等待reset_status轮询间隔(秒)
+LASER_TIMEOUT = 0.2             # 等待激光数据超时(秒)
+LASER_POLL_SLEEP = 0.01         # 激光轮询间隔(秒)
+RESET_SETTLE_DELAY = 0.2  		# 每轮复位后等待仿真刷新(秒)
+
+MAX_EPISODE_TIME = 300  		# 每轮最大时间(秒)（同样与时间刻相关）
+CONTROL_DT = 0.01            	# 控制周期(s),用于连续动作 （同样与时间刻相关）
 ```
 
-### 5.2 调整打印频率
+### btw
+每次实验建议记改了哪些参数、最终看的是哪几个指标
 
-根据需要调整各话题的打印频率：
+最简单可以补一个文本，比如：
 
-```python
-# 高频率详细调试
-laser_debug_freq=2.0    # 每0.5秒打印一次激光雷达数据
-device_debug_freq=2.0    # 每0.5秒打印一次设备状态
-control_debug_freq=5.0  # 每0.2秒打印一次控制指令
-
-# 低频率减少输出
-laser_debug_freq=0.1     # 每10秒打印一次
-device_debug_freq=0.5    # 每2秒打印一次
-control_debug_freq=0.5   # 每2秒打印一次
+```latex
+2026-06-18
+baseline: Results/ppo_nav_20260617_230722
+change: reward_weight_obstacle 0.9 -> 1.2
+change: apf_repulsive_gain 8.0 -> 10.0
+observe: success_rate_total, collision_rate_total, episode_return
 ```
 
-### 5.3 查看实时统计数据
+这样后面对比会轻松很多。
 
-按 `Ctrl+C` 停止服务后，会打印统计数据：
 
-```
-[Main] Stopping USV Navigation Service...
-[Debug Stats]
-  Total laser scans received: 1256
-  Total device status updates: 628
-  Total control commands sent: 2512
-```
+
+## 4.我目前做了什么
+1.改状态空间，连续二维动作空间和动作空间形式，actor，critic网络结构，使动作方差可学习，添加GAE奖励。  
+2.将输出动作映射为可执行动作，通过介入pid控制器
+
+3.设置apf-heading奖励，非线性目标进步奖励和障碍物惩罚  
+4.设置apf-pid 和 ppo 策略切换
+
+5.雷达数组修复，目标点错误下发修复，目标点错识别修复
+
+6.logger和可视化，我建议量化标准按csv里我用的来
+
+
+
+
+
+我觉得我能做的和能想到的都做了，如果有想到的可行的，算法或代码方面可以对照着进行补充。如果没有的话就是需要调可行的参数了。有能力的话录点可行的视频（我建议对于同组实验**每隔50-100轮录一次，不同组实验对比相同轮数效果**，也可以录可视化图）或者你们谁写个脚本把**CSV导成曲线图**也可以，后面交报告和ppt用。据孟哥说出效果本地得跑上个几千次，我建议是加快时间刻先跑着，剩下的调参的效果大家加油。
+
+
 
 ---
 
-## 六、测试检查清单
-
-运行 `main.py` 后，按照以下清单验证功能：
-
-| 检查项 | 预期结果 | 实际结果 |
-|--------|---------|---------|
-| 1. 连接成功 | 显示 `[ROS Debug] Connected to rosbridge` | |
-| 2. 激光雷达数据 | 每2秒输出激光雷达日志 | |
-| 3. 设备状态数据 | 每秒输出经纬度、航向角、速度 | |
-| 4. 控制指令 | 每0.5秒输出控制指令日志 | |
-| 5. EmboUnity 联动 | Unity 场景中无人船响应控制 | |
-| 6. 正常停止 | Ctrl+C 后显示统计数据 | |
-
----
-
-## 七、常见问题
-
-### Q1: 出现 `ModuleNotFoundError: No module named 'usvlib4ros'`
-
-**原因**：未将项目目录加入 Python 路径
-
-**解决**：
-```bash
-# 在项目根目录执行（Windows PowerShell）
-$env:PYTHONPATH = "$env:PYTHONPATH;{项目根目录}\usvlib4ros"
-python {项目根目录}\usvlib4ros\main.py
-
-# 或在 Python 代码中临时添加
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'usvlib4ros'))
-```
-
-### Q2: 出现 `WebSocket connection failed`
-
-**原因**：rosbridge 未启动或端口错误
-
-**解决**：
-1. 确认 VM 中 ros2-image 容器运行：`docker ps | grep ros2-image`
-2. 确认 rosbridge 监听端口：`docker exec ros2-image ss -tlnp | grep 9090`
-3. 检查 host 参数是否正确
-
-### Q3: 数据一直为 0 或不变
-
-**原因**：EmboUnity 未正确启动或 MATLAB 未运行
-
-**解决**：
-1. 确认 EmboUnity 已进入场景并选择智能体
-2. 确认 MATLAB 中 Simulink 模型正在运行（状态为 Running）
-
-### Q4: 停止后程序不退出的处理
-
-有时 `Ctrl+C` 可能无法立即停止，可再次按 `Ctrl+C` 或关闭终端窗口
-
----
-
-## 八、联系支持
-
-如遇到本文档未覆盖的问题，请联系开发人员并提供：
-1. 完整的终端输出日志
-2. 项目根目录路径（{项目根目录}）
-3. VM IP 和 deviceId 配置
-4. 测试环境描述（哪个步骤出错）
-
----
-
-*文档版本：v1.0*
-*更新日期：2026-05-15*
+感谢我的队友们与挚友qhy :)

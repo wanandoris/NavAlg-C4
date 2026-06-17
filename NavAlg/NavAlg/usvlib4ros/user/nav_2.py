@@ -22,33 +22,43 @@ from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, Rewar
 from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
 from usvlib4ros.user.training_logger import TrainingLogger
 
-# ==================== 超参数配置 ====================
+# ==================== PPO相关 ====================
 N_ACTIONS = 2          # 连续动作空间
-HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
 N_STATES = 96          # 状态维度: 前方180°激光点数(约90) + speed + rotated_speed + angel_diff + distance + obstacle_min_range + obstacle_angle
-MEMORY_CAPACITY = 2000
-BATCH_SIZE = 128
+HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
 LR_ACTOR = 0.00003
 LR_CRITIC = 0.0001
 GAMMA = 0.99           # 折扣因子
-K_EPOCHS = 8          # PPO更新轮数
+K_EPOCHS = 8           # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
 ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
-MAX_EPOCH = 4000       # 最大训练轮数
-MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
-MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
 UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
 MIN_BUFFER_SIZE_FOR_UPDATE = 256
-CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
-RESET_SETTLE_DELAY = 2.0  # 每轮复位后等待仿真刷新(秒)
-MAX_RESET_RETRIES = 5
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
 TEACHER_EPSILON_DECAY = 0.008  # APF-PID作为专家的概率衰减系数
 TEACHER_EPSILON_MIN = 0.20    # 专家概率下限
 
-# ==================== 导航常量 ====================
+# ==================== 奖励相关 ====================
+REWARD_ARRIVE_BONUS = 80
+REWARD_COLLISION_PENALTY = -50
+REWARD_WEIGHT_DISTANCE = 2.4
+REWARD_WEIGHT_OBSTACLE = 0.9
+REWARD_WEIGHT_HEADING = 1.0
+REWARD_WEIGHT_TIME = 0.2
+REWARD_PROGRESS_SCALE = 14.0
+REWARD_PROGRESS_WEIGHT = 0.7
+REWARD_PROXIMITY_WEIGHT = 0.3
+REWARD_PROXIMITY_EXPONENT = 2.4
+REWARD_PROXIMITY_NORMALIZER = 12.0
+REWARD_STEP_PENALTY = -0.005
+REWARD_MIN_ARRIVE_TIME_WEIGHT = 0.35
+REWARD_APF_ATTRACTIVE_GAIN = 1.0
+REWARD_APF_REPULSIVE_GAIN = 8.0
+REWARD_APF_OBSTACLE_INFLUENCE_RANGE = 2.5
+REWARD_TIME_EXPONENT = 1.4
+
+# ==================== 导航/PID 相关 ====================
 LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
-LASER_FRONT_HALF_DEG = 180   # 前方扫描扇区角度(度),仅用于碰撞检测
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
@@ -56,24 +66,33 @@ OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
 ACTION_TO_SPEED_CONTINOUS_SCALE = 120 # 连续动作映射到速度缩放因子
-CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
+CONTROL_DT = 0.01            # 控制周期(s),用于连续动作 （同样与时间刻相关）
 PPO_TARGET_HEADING_MAX_OFFSET = 90.0  # PPO目标航向最大偏转角(度)
-ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
-APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
 HEADING_PID_KP = 1.2
 HEADING_PID_KI = 0.02
 HEADING_PID_KD = 0.15
 HEADING_PID_INTEGRAL_LIMIT = 60.0
 
-# ==================== 奖励权重 ====================
-REWARD_ARRIVE_BONUS = 1000      # 到达奖励
-REWARD_COLLISION_PENALTY = -500 # 碰撞惩罚
-REWARD_OBSTACLE_PENALTY = -5    # 接近障碍物惩罚
-REWARD_NEAR_TARGET_BONUS = 1    # 靠近目标奖励
-REWARD_WEIGHT_DISTANCE = 0.6    # 距离奖励权重
-REWARD_WEIGHT_OBSTACLE = 0.5    # 障碍物惩罚权重
-REWARD_WEIGHT_HEADING = 0.3     # 航向奖励权重
+# ==================== 其它  ====================
+MAX_EPOCH = 4000       # 最大训练轮数
+MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
+MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)（同样与时间刻相关）
+CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
+MAX_RESET_RETRIES = 5
+ENABLE_APF_DEBUG_VIEW = False         # 是否打开APF方向实时调试窗口
+APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
+
+# ==================== 时间刻 ====================
+TASK_WAIT_SLEEP = 0.01          # 等待训练触发轮询间隔(秒)
+EMPTY_ROUTE_SLEEP = 0.01        # 航线为空时的等待间隔(秒)
+STEP_SLEEP = 0.01               # 每步主循环结束等待间隔(秒)
+FINAL_SLEEP = 0.2               # 异常/结束后的等待间隔(秒)
+RESET_START_SLEEP = 0.01        # reset_unity后首次等待(秒)
+RESET_STATUS_SLEEP = 0.01       # 等待reset_status轮询间隔(秒)
+LASER_TIMEOUT = 0.2             # 等待激光数据超时(秒)
+LASER_POLL_SLEEP = 0.01         # 激光轮询间隔(秒)
+RESET_SETTLE_DELAY = 0.2        # 每轮复位后等待仿真刷新(秒)
 
 
 @dataclass
@@ -129,8 +148,6 @@ class PPONav:
             writer=self.tb_writer.writer
         )
         self.next_state = None
-        self.action_size = N_ACTIONS  # 动作空间大小(用于角度映射)
-
         # 航线相关
         self.route = None
         self.destPoint: Point = Point()
@@ -140,7 +157,6 @@ class PPONav:
 
         # 训练状态
         self.max_distance = 0.0
-        self.score = 0
         self.episode_reward_sum = 0.0
         self.arrive = False
         self.done = False
@@ -153,27 +169,27 @@ class PPONav:
         )
         self.last_laser_scan = global_data.laser_data
         self.reward_config = RewardConfig(
-            reward_arrive_bonus=60,
-            reward_collision_penalty=-35,
-            reward_weight_distance=2.4,
-            reward_weight_obstacle=0.9,
-            reward_weight_heading=1.0,
-            reward_weight_time=0.2,
-            progress_scale=14.0,
-            obstacle_safe_range=4.5,
-            obstacle_penalty_scale=6.0,
-            step_penalty=-0.005,
-            min_arrive_time_weight=0.35,
+            reward_arrive_bonus=REWARD_ARRIVE_BONUS,
+            reward_collision_penalty=REWARD_COLLISION_PENALTY,
+            reward_weight_distance=REWARD_WEIGHT_DISTANCE,
+            reward_weight_obstacle=REWARD_WEIGHT_OBSTACLE,
+            reward_weight_heading=REWARD_WEIGHT_HEADING,
+            reward_weight_time=REWARD_WEIGHT_TIME,
+            progress_scale=REWARD_PROGRESS_SCALE,
+            progress_reward_weight=REWARD_PROGRESS_WEIGHT,
+            proximity_reward_weight=REWARD_PROXIMITY_WEIGHT,
+            proximity_exponent=REWARD_PROXIMITY_EXPONENT,
+            proximity_normalizer=REWARD_PROXIMITY_NORMALIZER,
+            step_penalty=REWARD_STEP_PENALTY,
+            min_arrive_time_weight=REWARD_MIN_ARRIVE_TIME_WEIGHT,
             target_slow_range=TARGET_SLOW_RANGE,
             angular_velocity_max=ANGULAR_VELOCITY_MAX,
             control_dt=CONTROL_DT,
-            has_continuous_action=HAS_CONTINUOUS_ACTION,
-            n_actions=N_ACTIONS,
             max_episode_time=MAX_EPISODE_TIME,
-            apf_attractive_gain=1.0,
-            apf_repulsive_gain=8.0,
-            apf_obstacle_influence_range=2.5,
-            time_exponent=1.4,
+            apf_attractive_gain=REWARD_APF_ATTRACTIVE_GAIN,
+            apf_repulsive_gain=REWARD_APF_REPULSIVE_GAIN,
+            apf_obstacle_influence_range=REWARD_APF_OBSTACLE_INFLUENCE_RANGE,
+            time_exponent=REWARD_TIME_EXPONENT,
         )
         self.rotate_control_mode = ROTATE_CONTROL_MODE.upper()
         self.teacher_prob = 1.0
@@ -205,7 +221,7 @@ class PPONav:
             try:
                 LogUtil.info("等待训练触发...")
                 while self.global_data.device_data.task_status == 0:
-                    time.sleep(0.1)
+                    time.sleep(TASK_WAIT_SLEEP)
 
                 for epoch in range(MAX_EPOCH):
                     if self.global_data.device_data.task_status == 0:
@@ -222,7 +238,7 @@ class PPONav:
                         self.route = self.ros_ctrl.getRoute()
                         if len(self.route.points) == 0:
                             LogUtil.error("航线数据为空")
-                            time.sleep(0.1)
+                            time.sleep(EMPTY_ROUTE_SLEEP)
                             continue
 
                         LogUtil.info(f"航线加载完成: {self.route}")
@@ -265,7 +281,7 @@ class PPONav:
                                 self._log_episode_metrics(epoch)
                                 break
 
-                            time.sleep(0.1)
+                            time.sleep(STEP_SLEEP)
 
                         if not self.done and not self.arrive and self.current_episode_step > 0:
                             self._log_episode_metrics(epoch)
@@ -303,7 +319,7 @@ class PPONav:
                 self._close_episode_logging()
                 self._close_tensorboard_writer()
                 self.training_logger.close()
-                time.sleep(2)
+                time.sleep(FINAL_SLEEP)
 
     def _reset_episode_state(self):
         """重置单轮训练的状态变量。"""
@@ -487,9 +503,9 @@ class PPONav:
     def _reset_and_prepare_episode(self) -> bool:
         for attempt in range(MAX_RESET_RETRIES):
             self.ros_ctrl.reset_unity()
-            time.sleep(0.1)
+            time.sleep(RESET_START_SLEEP)
             while self.global_data.device_data.reset_status != 2:
-                time.sleep(0.1)
+                time.sleep(RESET_STATUS_SLEEP)
 
             time.sleep(RESET_SETTLE_DELAY)
             self.ros_ctrl.set_auto_work()
@@ -553,16 +569,6 @@ class PPONav:
         obstacle_angle: float,
         angle_diff: float,
     ) -> tuple[float, float]:
-        heading_world = self._normalize_heading_360(heading)
-        apf_heading_diff = calc_apf_heading_diff(
-            angle_diff=angle_diff,
-            current_distance=current_distance,
-            obstacle_min_range=obstacle_min_range,
-            obstacle_angle=obstacle_angle,
-            heading_world=heading_world,
-            target_heading_world=self._normalize_heading_360(target_heading_world),
-            config=self.reward_config,
-        )
         ppo_heading_diff = self._clip(turn_ratio, 1.0) * PPO_TARGET_HEADING_MAX_OFFSET
         ppo_target_heading = self._normalize_signed_angle_diff(heading + ppo_heading_diff)
         return ppo_target_heading, ppo_heading_diff
@@ -737,7 +743,7 @@ class PPONav:
 
         else:
             """将离散动作映射为目标航向后再交给PID。"""
-            ang_vel = ((self.action_size - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((self.action_size - 1) / 2)
+            ang_vel = ((N_ACTIONS - 1) / 2 - action) * ANGULAR_VELOCITY_MAX / ((N_ACTIONS - 1) / 2)
             # 自适应速度
             adviseSpeed = DEFAULT_SPEED
             if obstacle_min_range < OBSTACLE_SLOW_RANGE:
@@ -954,96 +960,6 @@ class PPONav:
             self.enable_apf_debug_view = False
             LogUtil.error(f"APF debug view disabled: {exc}")
 
-    # ==================== 奖励函数 ====================
-
-    def _compute_reward(self, state: list, action: np.ndarray, max_distance: float, angle_diff: float) -> float:
-        """计算综合奖励值。"""
-        obstacle_min_range = state[-2]
-        current_distance = state[-3]
-        angle_diff_state = state[-4]
-
-        # 距离奖励
-        distance_reward = self._calc_distance_reward(current_distance, max_distance)
-
-        # 更新最大距离记录
-        if current_distance > max_distance:
-            self.max_distance = current_distance
-
-        # 航向奖励
-        heading_reward = self._calc_heading_reward(action, angle_diff_state, current_distance, max_distance, angle_diff)
-
-        # 障碍物/接近目标奖励
-        obstacle_reward = 0.0
-        if obstacle_min_range < 3:
-            obstacle_reward = REWARD_OBSTACLE_PENALTY
-        elif current_distance < TARGET_SLOW_RANGE:
-            obstacle_reward = REWARD_NEAR_TARGET_BONUS
-
-        # 加权组合
-        reward = (
-            distance_reward * REWARD_WEIGHT_DISTANCE
-            + obstacle_reward * REWARD_WEIGHT_OBSTACLE
-            + heading_reward * REWARD_WEIGHT_HEADING
-        )
-
-        # 终止奖励/惩罚
-        if self.arrive:
-            LogUtil.info("到达目标!")
-
-            # 计算自此轮训练开始的时间
-            episode_elapsed_time = time.time() - self.episode_start_time
-            # 时间奖励权重
-            time_reward_weight = self._calc_time_reward_weight(episode_elapsed_time)
-
-            reward += REWARD_ARRIVE_BONUS * time_reward_weight
-        elif self.done:
-            LogUtil.info("发生碰撞!")
-            reward += REWARD_COLLISION_PENALTY
-
-        return reward
-
-    @staticmethod
-    def _calc_time_reward_weight(episode_elapsed_time: float) -> float:
-        """计算时间权重。时间等于 MAX_EPISODE_TIME 时最小，为 0.5；等于 0 时最大，为 1.0。"""
-        if MAX_EPISODE_TIME <= 0:
-            return 1.0
-
-        progress = episode_elapsed_time / MAX_EPISODE_TIME
-        progress = max(0.0, min(1.0, progress))
-
-        min_weight = 0.5
-        return min_weight + (1.0 - min_weight) * ((1.0 - progress) ** 2)
-
-    @staticmethod
-    def _calc_distance_reward(current_distance: float, max_distance: float) -> float:
-        """计算基于目标距离的奖励。"""
-        if current_distance <= 1:
-            return 0.0
-        reward = 1 - (current_distance / max_distance)
-        return reward * 2 if reward < 0 else reward * 5
-
-    @staticmethod
-    def _calc_heading_reward(action: np.ndarray, angle_diff_state: float,
-                             current_distance: float, max_distance: float, angle_diff: float) -> float:
-        distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0
-        if not HAS_CONTINUOUS_ACTION:
-            """计算航向对齐奖励。"""
-            yaw_rewards = []
-            pi = math.pi
-            for i in range(N_ACTIONS):
-                angle = -pi / 4 + angle_diff_state + (pi / 8 * i) + pi / 2
-                tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
-                yaw_rewards.append(tr)
-
-            return round(yaw_rewards[action[0]] * 5, 2) * distance_rate
-        else:
-            """连续动作的航向奖励"""
-            angular_speed = action[0] * ANGULAR_VELOCITY_MAX          # 度/秒
-            predicted_angle_diff = (angle_diff - angular_speed * CONTROL_DT + 180) % 360 - 180
-            heading_reward = 1 - 2 * (abs(predicted_angle_diff) / 180.0)  # [1,-1]
-
-            return round(heading_reward, 2)
-
     # ==================== 导航处理 ====================
 
     def navigationHandler(self, state, episode: int, step: int) -> bool:
@@ -1136,9 +1052,9 @@ class PPONav:
 
     def _wait_for_laser_data(self):
         """等待新的激光雷达数据,超时返回None。"""
-        laser_scan = self.get_laser_scan(timeout=2)
+        laser_scan = self.get_laser_scan(timeout=LASER_TIMEOUT)
         if laser_scan is None:
-            LogUtil.info("获取激光雷达数据超时(2s)")
+            LogUtil.info(f"获取激光雷达数据超时({LASER_TIMEOUT}s)")
             return None
         self.last_laser_scan = laser_scan
         return laser_scan
@@ -1350,10 +1266,6 @@ class PPONav:
 
     # ==================== 内部工具方法 ====================
 
-    def __loadVehiclePoseInfo(self):
-        """向后兼容接口。"""
-        return self._load_vehicle_pose_info()
-
     def __reloadNavigationRoute(self, route) -> bool:
         """重新加载导航航线。"""
         self.route = route
@@ -1364,7 +1276,7 @@ class PPONav:
         """等待新的激光雷达数据,超时返回None。"""
         laser_start_time = time.time()
         while self.global_data.laser_data == self.last_laser_scan:
-            time.sleep(0.1)
+            time.sleep(LASER_POLL_SLEEP)
             if (time.time() - laser_start_time) > timeout:
                 return None
         return self.global_data.laser_data
