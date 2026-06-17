@@ -4,31 +4,31 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class RewardConfig:
-    reward_arrive_bonus: float = 1000
-    reward_collision_penalty: float = -500
+    reward_arrive_bonus: float = 60
+    reward_collision_penalty: float = -35
     reward_near_target_bonus: float = 1
-    reward_weight_distance: float = 1.8
-    reward_weight_obstacle: float = 1.8
-    reward_weight_heading: float = 1.6
-    reward_weight_time: float = 0.65
-    progress_scale: float = 10.0
-    obstacle_safe_range: float = 6.5
-    obstacle_penalty_scale: float = 10.0
-    step_penalty: float = -0.01
+    reward_weight_distance: float = 2.4
+    reward_weight_obstacle: float = 0.9
+    reward_weight_heading: float = 1.0
+    reward_weight_time: float = 0.2
+    progress_scale: float = 14.0
+    obstacle_safe_range: float = 4.5
+    obstacle_penalty_scale: float = 6.0
+    step_penalty: float = -0.005
     max_episode_time: float = 300.0
-    min_arrive_time_weight: float = 0.2
+    min_arrive_time_weight: float = 0.35
     target_slow_range: float = 3.0
     angular_velocity_max: float = 100
     control_dt: float = 0.1
     has_continuous_action: bool = True
     n_actions: int = 1
     speed_scale: float = 100.0
-    apf_attractive_gain: float = 0.8
-    apf_repulsive_gain: float = 18.0
-    apf_obstacle_influence_range: float = 3.0
+    apf_attractive_gain: float = 1.0
+    apf_repulsive_gain: float = 8.0
+    apf_obstacle_influence_range: float = 2.5
     apf_heading_repulsive_weight: float = 1.0
     pid_heading_consistency_scale: float = 45.0
-    time_exponent: float = 2.2
+    time_exponent: float = 1.4
 
 
 DEFAULT_REWARD_CONFIG = RewardConfig()

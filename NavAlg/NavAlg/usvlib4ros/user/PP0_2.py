@@ -1,6 +1,7 @@
 ﻿import logging
 import torch
 import torch.nn as nn
+import numpy as np
 import math
 from torch.distributions import Categorical, MultivariateNormal
 
@@ -39,158 +40,114 @@ class RolloutBuffer:
 
 
 class ActorCritic(nn.Module):
-    """Actor-Critic网络:Actor输出策略分布,Critic估计状态值。
-    
-    支持离散动作空间(使用Categorical分布)和连续动作空间(使用MultivariateNormal分布)。
-    """
+    """改进版 Actor-Critic：共享特征 + LayerNorm + SiLU + 正交初始化。"""
 
     def __init__(self, state_dim: int, action_dim: int,
                  has_continuous_action_space: bool, action_std_init: float):
-        """初始化 Actor 和 Critic 网络结构。
-
-        Args:
-            state_dim: 状态空间的维度
-            action_dim: 动作空间的维度(离散时为动作数,连续时为动作向量的维度)
-            has_continuous_action_space: 是否为连续动作空间
-            action_std_init: 连续动作空间下,初始化标准差(用于构建方差对角矩阵)
-        """
         super().__init__()
-        # 是否有连续动作空间
         self.has_continuous_action_space = has_continuous_action_space
+        hidden_dim = 256
 
-        #如果是连续动作空间,初始化动作方差
+        # ===== 共享特征提取器 =====
+        self.shared = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+        )
+
+        # ===== Actor 输出头 =====
+        self.actor_mean = nn.Linear(hidden_dim, action_dim)
+
+        # ===== Critic 输出头 =====
+        self.critic = nn.Linear(hidden_dim, 1)
+
+        # ===== 连续动作对数标准差 =====
         if has_continuous_action_space:
             self.action_dim = action_dim
-            # 学习 log_std 比直接学习方差更稳定,并可保证 std 始终为正
             self.log_std = nn.Parameter(
                 torch.full((action_dim,), math.log(action_std_init), dtype=torch.float32)
             )
 
-        # ========== Actor 网络 ==========
-        # 输入状态 -> 输出动作的概率(离散)或动作均值(连续)
-        if not has_continuous_action_space:
-            self.actor = nn.Sequential(
-                nn.Linear(state_dim, 256),   # 第一层全连接
-                nn.Tanh(),                   # 激活函数
-                nn.Linear(256, 256),         # 第二层全连接
-                nn.Tanh(),
-                nn.Linear(256, action_dim),  # 输出层
-                # 如果是离散动作空间,最后添加 Softmax 转换为概率分布；
-                nn.Softmax(dim=-1)
-            )
-        else:
-            self.actor = nn.Sequential(
-                nn.Linear(state_dim, 256),   # 第一层全连接
-                nn.Tanh(),                   # 激活函数
-                nn.Linear(256, 256),         # 第二层全连接
-                nn.Tanh(),
-                nn.Linear(256, action_dim),  # 输出层
-            )
+        self._init_weights()
 
-        # ========== Critic 网络 ==========
-        # 输入状态 -> 输出状态价值 V(s) (标量)
-        self.critic = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.Tanh(),
-            nn.Linear(256, 256),
-            nn.Tanh(),
-            nn.Linear(256, 1)
-        )
+    def _init_weights(self):
+        # 共享层 gain=np.sqrt(2)
+        for module in self.shared.modules():
+            if isinstance(module, nn.Linear):
+                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0.0)
+
+        # Actor 末层 gain=0.01
+        torch.nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        if self.actor_mean.bias is not None:
+            torch.nn.init.constant_(self.actor_mean.bias, 0.0)
+
+        # Critic 末层 gain=1.0
+        torch.nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        if self.critic.bias is not None:
+            torch.nn.init.constant_(self.critic.bias, 0.0)
+
+    def _get_log_std(self, learnable: bool) -> torch.Tensor:
+        log_std = torch.clamp(self.log_std, min=-3.0, max=-0.3)
+        return log_std if learnable else log_std.detach()
+
+    def _get_action_mean(self, raw_action: torch.Tensor) -> torch.Tensor:
+        raw_action = self._sanitize_tensor(raw_action)
+        return torch.tanh(raw_action)   # 统一 [-1, 1]
 
     @staticmethod
     def _sanitize_tensor(t: torch.Tensor) -> torch.Tensor:
-        """将张量中的 NaN 或 Inf 替换为 0,防止数值不稳定导致训练失败。
-
-        Args:
-            t: 输入张量
-
-        Returns:
-            处理后的张量,无效值被置为0
-        """
         return torch.where(
             torch.isnan(t) | torch.isinf(t), torch.zeros_like(t), t
         )
 
-    def _get_log_std(self, learnable: bool) -> torch.Tensor:
-        """在启用前冻结 log_std，首次到达后再允许其参与梯度更新。"""
-        # 连续动作已经有明确的物理边界 [-1, 1]，过大的采样方差会让动作频繁越界，
-        # 再被执行层裁到边界，表现成“长期打满舵”。
-        log_std = torch.clamp(self.log_std, min=-2.0, max=-0.3)
-        return log_std if learnable else log_std.detach()
-
     def act(self, state: torch.Tensor):
-        """根据当前状态采样一个动作,并返回动作及其对数概率(不计算梯度)。
-
-        Args:
-            state: 状态张量,形状通常为 (state_dim,) 或 (batch, state_dim)
-
-        Returns:
-            action: 采样的动作(张量)
-            log_prob: 该动作对应的对数概率(张量)
-        """
         state = self._sanitize_tensor(state.to(device))
+        shared_out = self.shared(state)
 
         if self.has_continuous_action_space:
-            # 连续动作空间:Actor 输出动作均值,使用对角协方差矩阵构建正态分布
-            raw = self.actor(state)
+            raw = self.actor_mean(shared_out)
             action_mean = self._get_action_mean(raw)
             log_std = self._get_log_std(learnable=True)
-            std = torch.exp(log_std)  # 标准差向量
+            std = torch.exp(log_std)
             scale_tril = torch.diag(std)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
-
         else:
-            # 离散动作空间:Actor 输出概率分布,需限制数值范围避免极值
-            action_probs = torch.clamp(self.actor(state), min=1e-6, max=1 - 1e-6)
-            action_probs = self._sanitize_tensor(action_probs)
-            # 归一化确保概率之和为 1(防止数值误差导致和不为 1)
-            action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-            dist = Categorical(action_probs)
+            logits = self.actor_mean(shared_out)
+            dist = Categorical(logits=logits)
 
         action = dist.sample()
         return action.detach(), dist.log_prob(action).detach()
 
     def evaluate(self, state: torch.Tensor, action: torch.Tensor, learnable_std: bool = True):
-        """评估给定状态-动作对的对数概率、状态价值以及分布的熵。
-
-        用于 PPO 更新阶段,根据旧策略收集的数据计算新策略的相关量。
-
-        Args:
-            state: 状态张量
-            action: 实际执行的动作张量
-
-        Returns:
-            log_prob: 在当前策略下,该状态-动作对的对数概率
-            state_value: Critic 网络给出的状态价值 V(s)
-                : 策略分布的熵,用于鼓励探索
-        """
         state = self._sanitize_tensor(state.to(device))
+        shared_out = self.shared(state)
 
         if self.has_continuous_action_space:
-            raw = self._sanitize_tensor(self.actor(state))
+            raw = self.actor_mean(shared_out)
             action_mean = self._get_action_mean(raw)
             action_mean = self._sanitize_tensor(action_mean)
             log_std = self._get_log_std(learnable=learnable_std)
-            std = torch.exp(log_std)                         # 标准差向量
-            # 扩展到批次维度：将 (action_dim,) 复制到 (batch, action_dim)
+            std = torch.exp(log_std)
             std_batch = std.unsqueeze(0).expand(action_mean.size(0), -1)
-            scale_tril = torch.diag_embed(std_batch)          # 批量对角矩阵
+            scale_tril = torch.diag_embed(std_batch)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
         else:
-            action_probs = torch.clamp(self.actor(state), min=1e-6, max=1 - 1e-6)
-            action_probs = self._sanitize_tensor(action_probs)
-            action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-            dist = Categorical(action_probs)
+            logits = self.actor_mean(shared_out)
+            dist = Categorical(logits=logits)
 
-        return dist.log_prob(action), self.critic(state), dist.entropy()
-    
-    def _get_action_mean(self, raw_action):
-        """对 Actor 输出的原始值分别施加不同的激活函数，得到动作均值。"""
-        # 避免任何原地操作，防止破坏 Sigmoid/Tanh 的反向传播图
-        raw_action = self._sanitize_tensor(raw_action)
-        mean_0 = torch.tanh(raw_action[..., 0:1])
-        mean_1 = torch.sigmoid(raw_action[..., 1:2])
-        return torch.cat([mean_0, mean_1], dim=-1)
+        state_value = self.critic(shared_out)
+        return dist.log_prob(action), state_value, dist.entropy()
+
+    def get_value(self, state: torch.Tensor) -> torch.Tensor:
+        """外部调用获得状态价值，内部自动经过共享层。"""
+        state = self._sanitize_tensor(state.to(device))
+        shared_out = self.shared(state)
+        return self.critic(shared_out)
 
 
 class PPO:
@@ -232,9 +189,10 @@ class PPO:
         self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
         # 优化器:Actor 和 Critic 使用各自的学习率(通过参数分组实现)
         self.optimizer = torch.optim.Adam([
-            {'params': self.policy.actor.parameters(), 'lr': lr_actor},
-            {'params' : [self.policy.log_std],'lr': lr_actor},
-            {'params': self.policy.critic.parameters(), 'lr': lr_critic}
+            {'params': self.policy.shared.parameters(), 'lr': lr_actor},
+            {'params': self.policy.actor_mean.parameters(), 'lr': lr_actor},
+            {'params': [self.policy.log_std], 'lr': lr_actor},
+            {'params': self.policy.critic.parameters(), 'lr': lr_critic},
         ])
 
         # 旧策略网络(用于采样,更新时与当前策略比较)
@@ -254,26 +212,18 @@ class PPO:
         )
 
     def select_action(self, state) -> int:
-        """根据当前状态选择动作,并将经验存入缓冲区。
-
-        Args:
-            state: 当前状态(可以是 numpy 数组或 torch 张量)
-
-        Returns:
-            action: 选出的动作(标量 int,用于离散动作空间)
-        """
-        state = self._sanitize_tensor(state.to(device))                     # 确保状态在正确的设备上
-        with torch.no_grad():                        # 采样时无需梯度
+        state = self._sanitize_tensor(state.to(device))
+        with torch.no_grad():
             action, logprob = self.policy_old.act(state)
-            state_value = self.policy_old.critic(state).squeeze(-1)
+            # 修改这一行：
+            state_value = self.policy_old.get_value(state).squeeze(-1)
 
-        # 将状态、动作、对数概率存储到缓冲区(转为 Python 列表以方便后续 JSON 序列化)
         self.buffer.states.append(state.cpu().numpy().tolist())
         self.buffer.actions.append(action.cpu().numpy().tolist())
         self.buffer.logprobs.append(logprob.cpu().numpy().tolist())
         self.buffer.state_values.append(float(state_value.item()))
 
-        return action.cpu().numpy() if self.has_continuous_action_space else action.item()  # 返回标量动作值
+        return action.cpu().numpy() if self.has_continuous_action_space else action.item()
 
     def update(self):
         """使用缓冲区中收集的经验更新策略网络(PPO 核心更新步骤)。"""
@@ -351,7 +301,7 @@ class PPO:
             self.optimizer.zero_grad()
             loss.mean().backward()
             # 梯度裁剪防止梯度爆炸
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
             self.optimizer.step()
 
         if self.tb_writer is not None:

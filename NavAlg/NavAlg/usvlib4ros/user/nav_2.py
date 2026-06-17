@@ -28,23 +28,23 @@ HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
 N_STATES = 96          # 状态维度: 前方180°激光点数(约90) + speed + rotated_speed + angel_diff + distance + obstacle_min_range + obstacle_angle
 MEMORY_CAPACITY = 2000
 BATCH_SIZE = 128
-LR_ACTOR = 0.0003
+LR_ACTOR = 0.00003
 LR_CRITIC = 0.0001
 GAMMA = 0.99           # 折扣因子
-K_EPOCHS = 20          # PPO更新轮数
+K_EPOCHS = 8          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
-ACTION_STD_INIT = 1  # 连续动作标准差初始化(当前未启用连续空间)
+ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
 MAX_EPOCH = 4000       # 最大训练轮数
 MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)
-UPDATE_INTERVAL = 200  # PPO更新间隔(步数)
-MIN_BUFFER_SIZE_FOR_UPDATE = 128
+UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
+MIN_BUFFER_SIZE_FOR_UPDATE = 256
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
-RESET_SETTLE_DELAY = 3.0  # 每轮复位后等待仿真刷新(秒)
+RESET_SETTLE_DELAY = 2.0  # 每轮复位后等待仿真刷新(秒)
 MAX_RESET_RETRIES = 5
-MIXED_ROTATE_CONTROL = False  # 是否启用APF-PID与PPO混合切换
-TEACHER_EPSILON_DECAY = 0.01  # APF-PID作为专家的概率衰减系数
-TEACHER_EPSILON_MIN = 0.05    # 专家概率下限
+MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
+TEACHER_EPSILON_DECAY = 0.008  # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.20    # 专家概率下限
 
 # ==================== 导航常量 ====================
 LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
@@ -55,9 +55,9 @@ DEFAULT_SPEED = 1.0          # 默认速度(m/s)
 OBSTACLE_SLOW_RANGE = 4.0    # 进入此范围开始减速(m)
 TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
-ACTION_TO_SPEED_CONTINOUS_SCALE = 200 # 连续动作映射到速度缩放因子
+ACTION_TO_SPEED_CONTINOUS_SCALE = 120 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.1             # 控制周期(s),用于连续动作
-PPO_TARGET_HEADING_MAX_OFFSET = 120.0  # PPO目标航向最大偏转角(度)
+PPO_TARGET_HEADING_MAX_OFFSET = 90.0  # PPO目标航向最大偏转角(度)
 ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
@@ -153,12 +153,27 @@ class PPONav:
         )
         self.last_laser_scan = global_data.laser_data
         self.reward_config = RewardConfig(
+            reward_arrive_bonus=60,
+            reward_collision_penalty=-35,
+            reward_weight_distance=2.4,
+            reward_weight_obstacle=0.9,
+            reward_weight_heading=1.0,
+            reward_weight_time=0.2,
+            progress_scale=14.0,
+            obstacle_safe_range=4.5,
+            obstacle_penalty_scale=6.0,
+            step_penalty=-0.005,
+            min_arrive_time_weight=0.35,
             target_slow_range=TARGET_SLOW_RANGE,
             angular_velocity_max=ANGULAR_VELOCITY_MAX,
             control_dt=CONTROL_DT,
             has_continuous_action=HAS_CONTINUOUS_ACTION,
             n_actions=N_ACTIONS,
             max_episode_time=MAX_EPISODE_TIME,
+            apf_attractive_gain=1.0,
+            apf_repulsive_gain=8.0,
+            apf_obstacle_influence_range=2.5,
+            time_exponent=1.4,
         )
         self.rotate_control_mode = ROTATE_CONTROL_MODE.upper()
         self.teacher_prob = 1.0
@@ -239,11 +254,9 @@ class PPONav:
                             self.done = self.navigationHandler(self.next_state, epoch, step)
 
                             # 定期更新PPO
-                            if step > 0 and step % UPDATE_INTERVAL == 0 and self._should_update_ppo():
-                                last_update_metrics = self.ppo_agent.update()
-                                self.training_logger.log_update(
-                                    epoch * MAX_STEP_PER_EPISODE + step,
-                                    last_update_metrics,
+                            if step > 0 and step % UPDATE_INTERVAL == 0:
+                                last_update_metrics = self._try_update_ppo(
+                                    epoch * MAX_STEP_PER_EPISODE + step
                                 )
 
                             self.setMonitorParameterValue()
@@ -257,12 +270,13 @@ class PPONav:
                         if not self.done and not self.arrive and self.current_episode_step > 0:
                             self._log_episode_metrics(epoch)
 
-                        if self._should_update_ppo():
-                            last_update_metrics = self.ppo_agent.update()
-                            self.training_logger.log_update(
+                        last_update_metrics = (
+                            self._try_update_ppo(
                                 epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
-                                last_update_metrics,
+                                force=True,
                             )
+                            or last_update_metrics
+                        )
 
                         # 定期保存模型
                         if epoch % CHECKPOINT_INTERVAL == 0:
@@ -456,6 +470,19 @@ class PPONav:
 
     def _should_update_ppo(self) -> bool:
         return len(self.ppo_agent.buffer.rewards) >= MIN_BUFFER_SIZE_FOR_UPDATE
+
+    def _try_update_ppo(self, global_step: int, force: bool = False):
+        if force:
+            if not self.ppo_agent.buffer.rewards:
+                return None
+            if len(self.ppo_agent.buffer.rewards) < self.ppo_agent.min_update_buffer_size:
+                return None
+        elif not self._should_update_ppo():
+            return None
+
+        update_metrics = self.ppo_agent.update()
+        self.training_logger.log_update(global_step, update_metrics)
+        return update_metrics
 
     def _reset_and_prepare_episode(self) -> bool:
         for attempt in range(MAX_RESET_RETRIES):
@@ -895,22 +922,8 @@ class PPONav:
                     )
 
             debug_lines = [
-                f"heading_world: {heading_world:.2f} deg",
-                f"target_heading_world: {target_world:.2f} deg",
-                f"prev_angle_diff: {prev_state[-4]:.2f} deg",
-                f"curr_angle_diff: {new_state[-4]:.2f} deg",
-                f"obstacle_angle(relative): {new_state[-1]:.2f} deg",
-                f"obstacle_feature_index: {obstacle_angle_idx}",
-                f"obstacle_min_range: {new_state[-2]:.2f} m",
-                f"prev_apf_heading_diff: {prev_apf_heading_diff:.2f} deg",
-                f"curr_apf_heading_diff: {curr_apf_heading_diff:.2f} deg",
-                f"pred_apf_heading_diff: {predicted_apf_heading_diff:.2f} deg",
                 f"teacher_prob: {self.teacher_prob:.3f}",
                 f"teacher_selected: {int(self.teacher_last_selected)}",
-                f"laser_points: {laser_count}",
-                f"turn_action: {turn_action:.3f}",
-                f"ppo_heading_diff: {self.last_heading_debug['ppo_heading_diff']:.2f}",
-                f"selected_target: {self.last_heading_debug['selected_target_heading']:.2f}",
                 f"reward: {reward:.3f}",
             ]
             for idx, line in enumerate(debug_lines):
