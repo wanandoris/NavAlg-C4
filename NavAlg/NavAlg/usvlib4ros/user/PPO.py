@@ -9,6 +9,9 @@ import tyro
 from torch.distributions.normal import Normal
 from collections import namedtuple
 
+import pandas as pd
+import os
+
 ACTION_MAX =  np.array([1,2], dtype=np.float32)   #动作最大数值，它和min都是多维度numpy数据，对应不同的action====根据nav,这里两维度是speed==rotate
 ACTION_MIN = np.array([0,-2], dtype=np.float32)   #在nav里会把action*100，因此这里仅仅把范围限制在（0,1）和（-2,2）
 OBS_DIM = 184
@@ -36,20 +39,20 @@ Transition = namedtuple(
 class Args:
     cuda: bool = True
     total_timesteps: int = 1000000
-    learning_rate: float = 3e-4
+    learning_rate: float = 9e-4
     num_envs: int = 1
     num_steps: int = 512       #每次策略更新收集的数据
     anneal_lr: bool = True   
-    gamma: float = 0.97
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     num_minibatches: int = 8    #一批数据几次梯度更新
     update_epochs: int = 3
     norm_adv: bool = True
     clip_coef: float = 0.2
     clip_vloss: bool = True
-    ent_coef: float = 0.0
+    ent_coef: float = 0.001
     vf_coef: float = 0.5
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 2
     target_kl: float = None
 
     batch_size: int = num_steps
@@ -134,16 +137,51 @@ class PPO:
         self.dones = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
         self.values = torch.zeros((self.args.num_steps, self.args.num_envs)).to(self.device)
         self.action = torch.zeros((2,)).to(self.device)
+        self.per_goal = 1024    #每1024步多少次goal
         
         self.episode_r_list = []    #存储所有episoder，来判断训练效果。若效果变好，则降低lr
+        self.dict = {
+            "learn_time": 0,
+            "arrive_time": 0,
+            "reward": 0.0,
+            "explain_var": 0.0
+        }
         self.learntime = 0
+        self.arrive_time = 0
         
         if ifload:                                  #保存
             self.load(self.agent,filepath= file_path)
         
 
+
+    def log(self, r_sum, explain_var):
+        # 1. 更新字典数据
+        self.dict["learn_time"] = self.learntime
+        self.dict["arrive_time"] = self.arrive_time
+        self.dict["reward"] = r_sum
+        self.dict["explain_var"] = explain_var
+        # 2. 定义保存路径
+        file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\training_log.xlsx" 
+        
+        # 3. 将当前字典转为 DataFrame
+        new_row = pd.DataFrame([self.dict])
+        
+        # 4. 追加写入 Excel
+        # 如果文件已存在，则追加数据且不写入表头；如果不存在，则新建文件并写入表头
+        if os.path.exists(file_path):
+            new_row.to_excel(file_path, mode='a', index=False, header=False)
+        else:
+            new_row.to_excel(file_path, index=False)
+        
+
+        
+
     def learn(self,next_obs,next_done):
         self.learntime += 1
+        
+        r_sum = sum(self.rewards)
+        
+        
         with torch.no_grad():
             next_value = self.agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(self.rewards).to(self.device)
@@ -224,13 +262,14 @@ class PPO:
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        print("=================explained_var",explained_var)
+        self.log(r_sum,explained_var)
+        self.arrive_time = 0
         
-    def save(self,model, filepath,total_steps,episode_r):
+    def save(self,model, filepath,total_steps,episode_r,done_time):
         """
         保存 PPO 模型的检查点
         """
-        filepath = os.path.join(filepath, "ppo_%d_reward_%d.pt"%(total_steps,int(episode_r)))
+        filepath = os.path.join(filepath, "ppo_%d_reward_%d_goal_%d.pt"%(total_steps,int(episode_r),done_time))
         checkpoint = {
             'model_state_dict': model.state_dict(),          # 保存 actor 和 critic 的网络权重
             'optimizer_state_dict': self.optimizer.state_dict(), # 保存优化器状态（如 Adam 的动量等）
@@ -242,7 +281,7 @@ class PPO:
         """
         加载 PPO 模型的检查点
         """
-        checkpoint = torch.load(filepath, map_location=self.device) # 自动适配 CPU/GPU
+        checkpoint = torch.load(filepath, map_location=self.device,weights_only=False) # 自动适配 CPU/GPU
         
         model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -271,13 +310,17 @@ class PPO:
         result = 1 / (1 + np.exp(-x*4))
         return (result-0.5)*2
     
-    def run(self,next_obs, reward, terminations,global_step,episode_r,iteration):
+    def run(self,next_obs, reward, terminations,global_step,episode_r,arrive):
+        
+
+        if arrive:
+            self.arrive_time +=1
+        print("=============",self.arrive_time)
         step = global_step % self.args.num_steps
         next_done = np.logical_or(terminations,0).astype(int)
         self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
         next_obs, next_done = torch.tensor(next_obs,dtype=torch.float32).to(self.device), torch.tensor(next_done).to(self.device)
         next_obs = torch.cat([next_obs,self.action],dim=0).unsqueeze(0) 
-        print("============nextdone",next_done)
         self.dones[step] = next_done
         with torch.no_grad():
                 action, logprob, _, value,action_ = self.agent.get_action_and_value(next_obs)
@@ -290,5 +333,5 @@ class PPO:
         if step == 0 and global_step > 0:
             self.learn(next_obs,next_done)
         if global_step % self.args.save == 0:
-            self.save(self.agent,self.args.file,global_step,episode_r)
+            self.save(self.agent,self.args.file,global_step,episode_r,self.arrive_time)
         return action_.cpu().numpy()
