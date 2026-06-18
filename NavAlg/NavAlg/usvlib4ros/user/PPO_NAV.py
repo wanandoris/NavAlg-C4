@@ -84,7 +84,7 @@ class PPO_NAV:
         self.dis_r_w = 1
         #=============碰撞判定超参数在上边
         self.arrive_time = []
-        
+        self.last_heading = 0
         
         self.routePlaneService = RoutePlanService(wayPointRadius=self.arrive_distance, route=self.route)
         """启动时缓存下当前激光雷达数据，算法中检测激光雷达数据对象是否变化来判断是否收到新的数据"""
@@ -760,8 +760,11 @@ class PPO_NAV:
             """第一次进入导航"""
             if state is None:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
-            action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,self.arrive)
+                
+            heading_diff = heading - self.last_heading
+            action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,self.arrive,heading_diff)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
+            self.last_heading = heading
             
             adviseSpeed = action[0,0]*100
             adviseRotate = action[0,1]*100
@@ -820,7 +823,7 @@ class PPO_NAV:
             reward += 100
         elif self.done:
             LogUtil.info("Collision!!")
-            reward += -50
+            reward += -100
         #reward = self.sigmoid_v1(reward/2.5)
         print("=======total_r",reward)
         self.show_reward(
@@ -836,6 +839,8 @@ class PPO_NAV:
         return reward 
     
     def set_reward_v1(self, state,action,heading,distance):
+        obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
+
         dis_r = 0
         if distance<1.5 :
             self.dis_r_w *=0.95
@@ -847,14 +852,19 @@ class PPO_NAV:
         if self.arrive:
             LogUtil.info("Goal!!")
             dis_r += 1000
+        elif self.done:
+            LogUtil.info("Collision!!")
+            reward += -100
         dis_r *= self.dis_r_w
-        reard = heading_r + dis_r
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
+
+        reard = heading_r + dis_r + obstacle_r
         self.show_reward(
     heading,
     distance,
     heading_r,
     0,
-    0,
+    obstacle_r,
     reard,
     dis_r,
     self.dis_r_w
@@ -881,6 +891,8 @@ class PPO_NAV:
 
     #     return reard
     def set_reward_v2(self, state,action,heading,distance):
+        obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
+
         dis_r = 0
         if distance<1.5 :
             self.dis_r_w *=0.97
@@ -892,11 +904,25 @@ class PPO_NAV:
         if self.arrive:
             LogUtil.info("Goal!!")
             dis_r += 1000
+        elif self.done:
+            LogUtil.info("Collision!!")
+            reward += -100
         dis_r *= self.dis_r_w
         speed_r = action[0,0]*10
-        reard = heading_r + dis_r + speed_r
-        print("======heading_r",heading_r,"====dis_r",dis_r,"====dis_w",self.dis_r_w)
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
 
+        reard = heading_r + dis_r + speed_r + obstacle_r
+
+        self.show_reward(
+    heading,
+    distance,
+    heading_r,
+    0,
+    obstacle_r,
+    reard,
+    dis_r,
+    self.dis_r_w
+        )
         return reard
     
     def normalize_feature(self,feat: np.ndarray):

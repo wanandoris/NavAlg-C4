@@ -314,7 +314,7 @@ class PPO:
         result = 1 / (1 + np.exp(-x*4))
         return (result-0.5)*2
     
-    def run(self,next_obs, reward, terminations,global_step,episode_r,arrive):
+    def run(self,next_obs, reward, terminations,global_step,episode_r,arrive,heading_diff):
         
 
         if arrive:
@@ -324,6 +324,7 @@ class PPO:
         next_done = np.logical_or(terminations,0).astype(int)
         self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
         next_obs, next_done = torch.tensor(next_obs,dtype=torch.float32).to(self.device), torch.tensor(next_done).to(self.device)
+        self.action[1] = heading_diff
         next_obs = torch.cat([next_obs,self.action],dim=0).unsqueeze(0) 
         self.dones[step] = next_done
         with torch.no_grad():
