@@ -155,24 +155,28 @@ class PPO:
 
 
     def log(self, r_sum, explain_var):
-        # 1. 更新字典数据
+
         self.dict["learn_time"] = self.learntime
         self.dict["arrive_time"] = self.arrive_time
         self.dict["reward"] = r_sum
         self.dict["explain_var"] = explain_var
-        # 2. 定义保存路径
-        file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\training_log.xlsx" 
-        
-        # 3. 将当前字典转为 DataFrame
+
+        file_path = r"D:\大赛资源\智能导航C4-2026\unpack\NavAlg-C4-v1\training_log.csv"
+
         new_row = pd.DataFrame([self.dict])
-        
-        # 4. 追加写入 Excel
-        # 如果文件已存在，则追加数据且不写入表头；如果不存在，则新建文件并写入表头
+
         if os.path.exists(file_path):
-            new_row.to_excel(file_path, mode='a', index=False, header=False)
+            new_row.to_csv(
+                file_path,
+                mode='a',
+                header=False,
+                index=False
+            )
         else:
-            new_row.to_excel(file_path, index=False)
-        
+            new_row.to_csv(
+                file_path,
+                index=False
+            )
 
         
 

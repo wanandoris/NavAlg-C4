@@ -219,13 +219,12 @@ class PPO_NAV:
         scan_range = []
         for i in range(total_points):
             value = scan.ranges[i]
-            # if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
-            #     scan_range.append(LASER_MAX_RANGE)
-            # else:
-            #     if value > 10 :
-            #         value = 10
-            #     scan_range.append(value)
-            scan_range.append(0)
+            if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
+                scan_range.append(LASER_MAX_RANGE)
+            else:
+                if value > 10 :
+                    value = 10
+                scan_range.append(value)
         return scan_range
 
     @staticmethod
@@ -337,6 +336,9 @@ class PPO_NAV:
                             break
                         tempTime = time.time() - startTime
 
+                        if t ==499:
+                           self.arrive_time.append(0)
+
                         if tempTime > 300:
                             """本轮训练持续时间过长，主动结束本轮，开启下一轮"""
                             break
@@ -407,11 +409,13 @@ class PPO_NAV:
         if COLLISION_DISTANCE > obstacle_min_range > 0:
             LogUtil.info(f"检测到碰撞! obstacle_min_range={obstacle_min_range}")
             self.done = True
+            self.arrive_time.append(0)
 
         # 到达检测
         if self._is_last_waypoint_reached(current_distance):
             self.arrive = True
             self.arrive_time.append(1)
+        print("==============",self.arrive_time)
         #scan_range = self.normalize_feature(scan_range)  #正则化
         return np.append(scan_range , [heading, current_distance, obstacle_min_range, obstacle_angle])   #乘上一个数是为了让模型放更大的注意在这些参数上
 
@@ -442,11 +446,13 @@ class PPO_NAV:
         if COLLISION_DISTANCE > obstacle_min_range > 0:
             LogUtil.info(f"检测到碰撞! obstacle_min_range={obstacle_min_range}")
             self.done = True
+            self.arrive_time.append(0)
 
         # 到达检测
         if self._is_last_waypoint_reached(current_distance):
             self.arrive = True
             self.arrive_time.append(1)
+        print("==============",self.arrive_time)
         #scan_range = self.normalize_feature(scan_range)  #正则化
         return np.append(scan_range , [heading, current_distance, 0, 0])   #乘上一个数是为了让模型放更大的注意在这些参数上
     
@@ -495,7 +501,6 @@ class PPO_NAV:
         """
         state = state[0]
 
-        print("===========heading",heading,"========shipToNextWPDistance",shipToNextWPDistance)
         
            
         state = self.getState(laser_scan, heading, shipToNextWPDistance)
@@ -757,7 +762,6 @@ class PPO_NAV:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
             action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,self.arrive)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
-            print("===========time",time)
             
             adviseSpeed = action[0,0]*100
             adviseRotate = action[0,1]*100
@@ -889,7 +893,7 @@ class PPO_NAV:
             LogUtil.info("Goal!!")
             dis_r += 1000
         dis_r *= self.dis_r_w
-        speed_r = action[0,0]*7
+        speed_r = action[0,0]*10
         reard = heading_r + dis_r + speed_r
         print("======heading_r",heading_r,"====dis_r",dis_r,"====dis_w",self.dis_r_w)
 
