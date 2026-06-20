@@ -65,7 +65,7 @@ class PPO_NAV:
         self.navThread = None
 
         #模型
-        self.ppo_agent = PPO(ifload=True,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models\\ppo_2048_reward_-443_goal_0.pt")
+        self.ppo_agent = PPO(ifload=False,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models\\ppo_2048_reward_-443_goal_0.pt")
         self.next_state = None
         self.action_size = 5 #动作空间
         self.isbug = 0
@@ -105,7 +105,7 @@ class PPO_NAV:
     dis_r_w
 ):
 
-        img = np.zeros((400,600,3),dtype=np.uint8)
+        img = np.zeros((400, 600, 3), dtype=np.uint8)
 
         cv2.putText(img,
             f"heading: {heading:.2f}",
@@ -174,6 +174,8 @@ class PPO_NAV:
     
     def _extract_laser_features(self, scan) -> list:
         """
+        半雷达点
+        
         从激光雷达数据提取特征，仅取前方180°扇区用于碰撞检测。
 
         假设ROS LaserScan的ranges按角度顺序排列，中间索引对应船体正前方。
@@ -197,13 +199,15 @@ class PPO_NAV:
         return scan_range
     
     def _extract_laser_features_v1(self, scan) -> list:
-        
+        """
+        乱雷达点
+        """
         total_points = len(scan.ranges)
         
 
         scan_range = []
         for i in range(total_points):
-            value = scan.ranges[i]
+            value = num = np.random.randint(1, LASER_MAX_RANGE+1)
             if value == float('Inf') or value is None or np.isnan(value) or value > LASER_MAX_RANGE:
                 scan_range.append(LASER_MAX_RANGE)
             else:
@@ -212,6 +216,9 @@ class PPO_NAV:
                 scan_range.append(value)
         return scan_range
     def _extract_laser_features_v2(self, scan) -> list:
+        """
+        全雷达点
+        """
         
         total_points = len(scan.ranges)
         
@@ -395,12 +402,10 @@ class PPO_NAV:
         Returns:
             状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle]
         """
-        scan_range = self._extract_laser_features_v1(scan)
+        scan_range = self._extract_laser_features_v2(scan)
         obstacle_min_range = round(min(scan_range), 2)
         obstacle_angle = np.argmin(scan_range)
-        
-        scan_range = self._extract_laser_features_v2(scan)
-        
+                
         LogUtil.debug(
             f"状态: heading={heading:.2f}, distance={current_distance:.2f}, "
             f"obstacle_min={obstacle_min_range:.2f}, obstacle_angle={obstacle_angle}"
@@ -432,12 +437,10 @@ class PPO_NAV:
         Returns:
             状态向量 [laser_features..., heading, distance, obstacle_min_range, obstacle_angle]
         """
-        scan_range = self._extract_laser_features_v1(scan)
+        scan_range = self._extract_laser_features_v2(scan)
         obstacle_min_range = round(min(scan_range), 2)
         obstacle_angle = np.argmin(scan_range)
-        
-        scan_range = self._extract_laser_features_v2(scan)
-        
+                
         LogUtil.debug(
             f"状态: heading={heading:.2f}, distance={current_distance:.2f}, "
             f"obstacle_min={obstacle_min_range:.2f}, obstacle_angle={obstacle_angle}"
@@ -454,7 +457,9 @@ class PPO_NAV:
             self.arrive_time.append(1)
         print("==============",self.arrive_time)
         #scan_range = self.normalize_feature(scan_range)  #正则化
-        return np.append(scan_range , [heading, current_distance, 0, 0])   #乘上一个数是为了让模型放更大的注意在这些参数上
+        
+        scan_range = self._extract_laser_features_v1(scan)
+        return np.append(scan_range , [heading, current_distance, 10, obstacle_angle])   #乘上一个数是为了让模型放更大的注意在这些参数上
     
     
     def judge_stage(self):
@@ -523,7 +528,7 @@ class PPO_NAV:
            
         state = self.getState(laser_scan, heading, shipToNextWPDistance)
 
-        reward = self.setReward(state,action,heading,shipToNextWPDistance)    #速度
+        reward = self.set_reward_v2(state,action,heading,shipToNextWPDistance)    #速度
 
         return state, reward,  heading
 
@@ -841,30 +846,28 @@ class PPO_NAV:
     def set_reward_v1(self, state,action,heading,distance):
         obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
 
+        
         dis_r = 0
         if distance<1.5 :
             self.dis_r_w *=0.95
             self.dis_r_w -= 0.01
             dis_r = (4-distance)**4
-        heading_r = -abs(heading)+10  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
+        heading_r = self.sigmoid_v1(5-abs(heading/6))*2  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
         if heading_r<0:
             heading_r =heading_r/5 
         if self.arrive:
             LogUtil.info("Goal!!")
             dis_r += 1000
-        elif self.done:
-            LogUtil.info("Collision!!")
-            reward += -100
         dis_r *= self.dis_r_w
-        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
-
-        reard = heading_r + dis_r + obstacle_r
+        speed_r = action[0,0]
+        print("=========speed",speed_r)
+        reard = heading_r + dis_r + speed_r
         self.show_reward(
     heading,
     distance,
     heading_r,
     0,
-    obstacle_r,
+    0,
     reard,
     dis_r,
     self.dis_r_w
@@ -898,7 +901,7 @@ class PPO_NAV:
             self.dis_r_w *=0.97
 
             dis_r = (4-distance)**4
-        heading_r = -abs(heading)+10  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
+        heading_r = self.sigmoid_v1(5-abs(heading/6))*2  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
         if heading_r<0:
             heading_r =heading_r/5 
         if self.arrive:
@@ -906,12 +909,13 @@ class PPO_NAV:
             dis_r += 1000
         elif self.done:
             LogUtil.info("Collision!!")
-            reward += -100
+            reward += -500
         dis_r *= self.dis_r_w
-        speed_r = action[0,0]*10
+        speed_r = action[0,0]
         obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
 
-        reard = heading_r + dis_r + speed_r + obstacle_r
+        print("==============speedr",speed_r)
+        reard = heading_r + dis_r + speed_r - obstacle_r
 
         self.show_reward(
     heading,

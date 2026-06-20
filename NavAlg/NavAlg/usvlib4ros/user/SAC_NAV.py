@@ -543,6 +543,8 @@ class SAC_NAV:
             """第一次进入导航"""
             if state is None:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
+                
+            
             state = np.expand_dims(state, axis=0)     #增添维度适应SAC类要求
             action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
