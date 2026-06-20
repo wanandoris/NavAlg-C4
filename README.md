@@ -1,57 +1,133 @@
-=========SAC============
-经过测试目前阶段第一次训练可以达到训练效果。但第二次时模型就直接训成模型输出的最大值了，推测是有极端reward混进去导致的
-model下1024的pt模型是有一定训练效果的，但2024则训崩了，只会输出能输出的最大值
-此代码的亮点是
-1. 用了SAC但由于没有截断函数之类的效果可能不如PPO
-2. 设置奖励函数代码如下  经测试的确是有效果的.其中 distance_w 是 heading_r计算时的参数，与目标距离越小，对于heading奖励的放大效应越大    heading奖励则是在很大的值下趋于平滑
+# 这是AI生成的readme
 
 
 
+# USV 智能导航算法实验仓库
 
-   def setReward(self, state,action,heading,distance):       # 少一个方向reward    scanreward和obreward只能有一个好像
-        obstacle_min_range = state[-2] / OBSTACLE_MIN_RANGE_W         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
-        obstacle_r = (5-obstacle_min_range)*(5-obstacle_min_range)*5
-        print("=======obstacle_r",obstacle_r,"======dis_to_obstacle===",obstacle_min_range)
-        distance_w = self.binary_cross_entropy_v1(1,(distance-self.arrive_distance)/600)/3     # ==========或许公式要改  与目标点最小距离，达到即判定抵达，与目前距离的交叉熵的平方除以三。我觉得这个数值合适
-        print("=====distance=====",distance-self.arrive_distance,"=======dis_w=======",distance_w)
-        
-        heading_r = distance_w*self.sigmoid_v1(5-abs(heading/9))*2  #===-1~1，对准时在0.9左右        #=============或许要改
-        if heading_r < -30:
-            heading_r = -30          #防止在目标旁边转向太猛扣太多，从而不敢去目标
-        print("=====heading=====",heading,"======heading_r",heading_r)
+本仓库用于验证无人船（USV）在仿真环境中的导航与避障策略，重点关注 **SAC** 和 **PPO** 两类强化学习方法的训练效果与奖励设计。项目中既包含训练逻辑，也包含与 ROS / Unity 仿真平台的交互代码。
 
-        speed_r = action[0,0]*7                            #==========速度越大奖励越高。具体还得测试
-        if distance<=5:
-            goal_r = (5-distance)*(5-distance)*5
-        else:
-            goal_r = 0
-        reward = heading_r+speed_r-obstacle_r+goal_r     #朝向+速度（较小）-障碍距离+目标距离（与障碍抵消）
-        print("=======total_r",reward)
-        if self.arrive:
-            LogUtil.info("Goal!!")
-            reward += 100
-        elif self.done:
-            LogUtil.info("Collision!!")
-            reward += -50
-        return reward
-    
-    def binary_cross_entropy_v1(self,y_true, y_pred):
-        """计算二分类交叉熵损失的二次方"""
-        epsilon = 1e-15
-        # 防止 log(0) 导致数值溢出
-        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
-        loss = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
-        return loss*loss
-    def sigmoid_v1(self,x):
-        """
-        对于结果进行处理，最后为-1~1
-        Sigmoid 激活函数（包含数值稳定性优化）
-        :param x: 输入值（可以是标量、列表或 NumPy 数组）
-        :return: 经过 Sigmoid 处理后的输出，范围在 (0, 1) 之间
-        """
-        result = 1 / (1 + np.exp(-x))
-        return (result-0.5)*2
+---
 
-================PPO=============
-1.采用分步训练根据船的成果调整奖励和state主要分为step1    step2    step3
-2.PPO连续控制，obs输入为state+action
+## 2. 代码亮点
+
+### 2.1 SAC 训练尝试
+
+- 使用了 SAC 框架进行连续控制策略学习
+- 观察到：**第一次训练**时模型通常能表现出一定的导航效果
+- 但在后续训练中，可能出现模型输出趋向极大值的问题，推测与异常奖励信号或奖励尺度失控有关
+- 后续实践表明SAC网络更新往往太过于激进不好调试
+
+### 2.2 PPO 分阶段训练
+
+- PPO 方案采用了分阶段训练思路
+- 根据船体状态与任务进展，动态调整奖励和状态表达
+- 代码中通过 `step_v1 / step_v2 / step_v3` 对训练阶段进行区分，便于分析不同阶段对策略学习的影响
+- 另外，模型输入中加入了状态与动作的联合信息，提升了策略对当前行为的感知能力
+
+### 2.3 奖励设计思路
+
+项目中的奖励函数重点考虑了以下几个因素：
+
+- 航向误差奖励（使船尽量朝向目标点）
+- 目标距离奖励（当船靠近目标时提升奖励）
+- 障碍距离惩罚（避免接近障碍物）
+- 速度奖励（鼓励在安全范围内提高速度）
+- 到达/碰撞终止奖励（用于强化任务完成与失败信号）
+
+下面是当前实验中使用过的奖励设计核心思想：
+
+```python
+def setReward(self, state, action, heading, distance):
+    obstacle_min_range = state[-2] / OBSTACLE_MIN_RANGE_W
+    obstacle_r = (5 - obstacle_min_range) * (5 - obstacle_min_range) * 5
+
+    distance_w = self.binary_cross_entropy_v1(
+        1, (distance - self.arrive_distance) / 600
+    ) / 3
+
+    heading_r = distance_w * self.sigmoid_v1(5 - abs(heading / 9)) * 2
+    if heading_r < -30:
+        heading_r = -30
+
+    speed_r = action[0, 0] * 7
+    if distance <= 5:
+        goal_r = (5 - distance) * (5 - distance) * 5
+    else:
+        goal_r = 0
+
+    reward = heading_r + speed_r - obstacle_r + goal_r
+
+    if self.arrive:
+        reward += 100
+    elif self.done:
+        reward += -50
+
+    return reward
+```
+
+其中：
+
+- `distance_w` 会随着距离减小而增强对航向奖励的影响
+- `sigmoid_v1` 用于把航向误差映射到一个相对平滑的奖励范围
+- 该设计在实验中被认为对导航效果有一定帮助
+
+
+###以上内容是第一版最终版参见PPO_NAV
+---
+
+## 3. 目录结构
+
+```text
+.
+├── README.md                  # 项目说明文档
+├── docs/                      # 竞赛文档与说明
+├── model/                     # SAC已保存的模型文件
+├── ppo_models/                # PPO 相关模型权重
+├── traning_logs/              # PPO训练日志
+└── NavAlg/
+    └── NavAlg/
+        ├── usvlib4ros/        # 核心 ROS/导航逻辑
+        ├── requirements.txt   # 依赖列表
+        └── setup.py           # 安装配置
+```
+
+---
+
+## 4. 环境要求
+
+建议环境：
+
+- Python 3.9 / 3.10
+- PyTorch
+- NumPy
+- OpenCV
+- ROSLIBPY
+
+
+## 5. 运行方式
+
+### 5.1 运行主程序
+SAC:
+```bash
+cd NavAlg/NavAlg
+python usvlib4ros/main.py
+```
+PPO:
+```bash
+cd NavAlg/NavAlg
+python usvlib4ros/main(1).py
+```
+### 5.2 运行 PPO 导航逻辑
+
+项目中也提供了 PPO 导航控制实现，文件为：
+
+- [NavAlg/NavAlg/usvlib4ros/user/PPO_NAV.py](NavAlg/NavAlg/usvlib4ros/user/PPO_NAV.py)
+
+### 5.3 运行 SAC 导航逻辑
+
+SAC 相关实现位于：
+
+- [NavAlg/NavAlg/usvlib4ros/user/SAC_NAV.py](NavAlg/NavAlg/usvlib4ros/user/SAC_NAV.py)
+
+
+---
