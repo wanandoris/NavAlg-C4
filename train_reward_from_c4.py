@@ -8,22 +8,23 @@ Train RewardWeightNet from data_collection.csv
 
 映射关系：
     features = [d_goal, theta_goal, d_obs_min, theta_obs_min]
-    reward_components = [r_goal_dist, r_obs_dist, r_apf]
+    reward_components = [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
 
 说明：
     1. distance              -> d_goal
     2. degreeAship           -> theta_goal
     3. obstacle_min_range    -> d_obs_min
     4. obstacle_angle        -> theta_obs_min
-    5. distance_reward_raw   -> r_goal_dist
-    6. obstacle_reward_raw   -> r_obs_dist
-    7. heading_reward_raw + obstacle_reward_raw -> r_apf
-    8. task_reward           -> task_rewards，用于计算未来回报 G_t
-    9. done                  -> dones
+    5. distance_reward_raw   -> r_goal_progress
+    6. distance              -> r_goal_proximity = 1 - d_goal_norm
+    7. obstacle_reward_raw   -> r_obs_dist
+    8. heading_reward_raw -> r_apf
+    9. task_reward           -> task_rewards，用于计算未来回报 G_t
+    10. done                 -> dones
 
 注意：
     total_reward 如果是手工加权后的连续奖励，不应该再作为训练目标。
-    task_reward 应该是任务级离散奖励，例如到达目标 +100，碰撞 -100，普通步 -0.01。
+    task_reward 应该是任务级离散奖励，例如到达目标 +1，碰撞 -1，普通步 -0.01。
 """
 
 import os
@@ -35,13 +36,22 @@ from typing import Dict, List, Tuple
 
 import torch
 
-from c4_project import (
-    RewardWeightConfig,
-    RewardWeightNet,
-    pretrain_reward_net,
-    train_reward_net_by_correlation,
-    save_reward_net,
-)
+try:
+    from usvlib4ros.user.c4_project import (
+        RewardWeightConfig,
+        RewardWeightNet,
+        pretrain_reward_net,
+        train_reward_net_by_correlation,
+        save_reward_net,
+    )
+except ImportError:
+    from c4_project import (
+        RewardWeightConfig,
+        RewardWeightNet,
+        pretrain_reward_net,
+        train_reward_net_by_correlation,
+        save_reward_net,
+    )
 
 
 # ==========================================================
@@ -49,7 +59,8 @@ from c4_project import (
 # ==========================================================
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_PATH = os.path.join(CURRENT_DIR, "data_collection.csv")
+PACKAGE_DIR = os.path.dirname(CURRENT_DIR)
+CSV_PATH = os.path.join(PACKAGE_DIR, "data_collection.csv")
 SAVE_PATH = os.path.join(CURRENT_DIR, "reward_weight_net_from_csv.pth")
 NORMALIZER_PATH = os.path.join(CURRENT_DIR, "reward_input_normalizer.json")
 
@@ -104,9 +115,9 @@ def angle_degree_to_minus1_1(values: torch.Tensor) -> torch.Tensor:
 def get_task_reward_from_raw(
     raw_step: Dict[str, float],
     step_penalty: float = -0.01,
-    goal_reward: float = 100.0,
-    collision_penalty: float = -100.0,
-    timeout_penalty: float = -30.0,
+    goal_reward: float = 1.0,
+    collision_penalty: float = -1.0,
+    timeout_penalty: float = -0.3,
 ) -> float:
     """
     生成用于计算 G_t 的任务级奖励。
@@ -205,7 +216,7 @@ def raw_step_to_network_input(
 
     返回：
         features: [4] = [d_goal_norm, theta_goal_norm, d_obs_min_norm, theta_obs_norm]
-        reward_components: [3] = [r_goal_dist, r_obs_dist, r_apf]
+        reward_components: [4] = [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
         task_reward: float
         done: float
     """
@@ -229,8 +240,9 @@ def raw_step_to_network_input(
     reward_components = torch.tensor(
         [
             distance_reward_raw,
+            1.0 - float(d_goal.item()),
             obstacle_reward_raw,
-            heading_reward_raw + obstacle_reward_raw,
+            heading_reward_raw,
         ],
         dtype=torch.float32,
     )
@@ -249,8 +261,8 @@ def load_csv_dataset(
         features: [N, 4]
             [d_goal, theta_goal, d_obs_min, theta_obs_min]
 
-        reward_components: [N, 3]
-            [r_goal_dist, r_obs_dist, r_apf]
+        reward_components: [N, 4]
+            [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
 
         task_rewards: [N]
             优先用 task_reward 作为任务奖励，用来计算未来回报 G_t。
@@ -336,21 +348,24 @@ def load_csv_dataset(
     )
 
     # ------------------------------------------------------
-    # 三个基础奖励分量 reward_components
+    # 四个基础奖励分量 reward_components
     # ------------------------------------------------------
-    # 目标距离奖励：CSV 已经给出 distance_reward_raw
-    r_goal_dist = distance_reward_raw
+    # 目标进度奖励：CSV 已经给出 distance_reward_raw（来自每步距离变化/进度）
+    r_goal_progress = distance_reward_raw
+
+    # 目标接近度奖励：越接近目标越大，使用归一化距离构造到 [0, 1]
+    r_goal_proximity = 1.0 - d_goal
 
     # 障碍物距离奖励：CSV 已经给出 obstacle_reward_raw
     # 注意你的 obstacle_reward_raw 大多是 <= 0，表示靠近障碍物惩罚。
     r_obs_dist = obstacle_reward_raw
 
-    # APF 奖励：这里用 heading_reward_raw + obstacle_reward_raw 近似
+    # APF/航向奖励：只使用 heading_reward_raw，避免与 r_obs_dist 重复计入障碍物惩罚。
     # 如果以后你有真正的 attractive_reward / repulsive_reward，可以替换这里。
-    r_apf = heading_reward_raw + obstacle_reward_raw
+    r_apf = heading_reward_raw
 
     reward_components = torch.stack(
-        [r_goal_dist, r_obs_dist, r_apf],
+        [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf],
         dim=1,
     )
 
@@ -379,7 +394,7 @@ def print_dataset_info(
     print(features[:5])
     print()
 
-    print("reward_components 前 5 行 [r_goal_dist, r_obs_dist, r_apf]:")
+    print("reward_components 前 5 行 [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]:")
     print(reward_components[:5])
     print()
 
@@ -414,9 +429,11 @@ def main():
         safe_distance=1.0,
         goal_dist_min=0.1,
         goal_dist_max=2.0,
+        goal_proximity_min=0.05,
+        goal_proximity_max=1.5,
         obs_dist_min=0.1,
         obs_dist_max=3.0,
-        apf_min=0.5,
+        apf_min=1.0,
         apf_max=5.0,
         use_layer_norm=True,
     )
@@ -443,7 +460,7 @@ def main():
     # 第二步：用任务级离散奖励做相关性训练
     # ------------------------------------------------------
     # 训练目标：让
-    #   w_goal*r_goal + w_obs*r_obs + w_apf*r_apf
+    #   w_goal_progress*r_goal_progress + w_goal_proximity*r_goal_proximity + w_obs*r_obs + w_apf*r_apf
     # 和未来任务回报 G_t 尽量正相关。
     # 注意：G_t 来自 task_reward，不再默认来自手工加权后的 total_reward。
     print("\n开始 ACWI 风格相关性训练...")
@@ -458,7 +475,7 @@ def main():
         batch_size=32,
         lr=5e-4,
         lambda_reg=1e-3,
-        weight_ref=torch.tensor([1.0, 1.5, 3.0], dtype=torch.float32),
+        weight_ref=torch.tensor([1.0, 0.5, 1.5, 3.0], dtype=torch.float32),
         device=device,
     )
 
@@ -475,17 +492,18 @@ def main():
         sample_weights = reward_net(sample_features).cpu()
 
     print("\n前 10 个样本对应的动态奖励权重:")
-    print("列含义: [w_goal_dist, w_obs_dist, w_apf]")
+    print("列含义: [w_goal_progress, w_goal_proximity, w_obs_dist, w_apf]")
     print(sample_weights)
 
     print("\n单个状态调用示例:")
     one_state = features[0]
-    w_goal, w_obs, w_apf = reward_net.get_weights(one_state)
+    w_goal_progress, w_goal_proximity, w_obs, w_apf = reward_net.get_weights(one_state)
     print("输入状态 features[0] =", one_state.tolist())
     print("输出权重:")
-    print("w_goal_dist =", w_goal)
-    print("w_obs_dist  =", w_obs)
-    print("w_apf       =", w_apf)
+    print("w_goal_progress  =", w_goal_progress)
+    print("w_goal_proximity =", w_goal_proximity)
+    print("w_obs_dist       =", w_obs)
+    print("w_apf            =", w_apf)
 
     print("\n实时单步数据转换示例:")
     example_raw_step = {

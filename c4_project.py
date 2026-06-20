@@ -2,13 +2,14 @@
 Reward Weight Network for USV Reinforcement Learning
 
 功能：
-1. 根据无人艇当前状态和障碍物风险，动态输出三个奖励参数：
-   - w_goal_dist: 目标点距离奖励权重
+1. 根据无人艇当前状态和障碍物风险，动态输出四个奖励参数：
+   - w_goal_progress: 目标点进度奖励权重
+   - w_goal_proximity: 目标点接近度奖励权重
    - w_obs_dist: 障碍物距离负奖励权重
    - w_apf: 引力斥力奖励权重
 
 2. 将基础奖励组合为总奖励：
-   R_t = w_goal_dist * r_goal_dist + w_obs_dist * r_obs_dist + w_apf * r_apf
+    R_t = w_goal_progress * r_goal_progress + w_goal_proximity * r_goal_proximity + w_obs_dist * r_obs_dist + w_apf * r_apf
 
 推荐输入特征：
     x_t = [d_goal, theta_goal, d_obs_min, theta_obs_min]
@@ -19,7 +20,7 @@ Reward Weight Network for USV Reinforcement Learning
 3. 支持参考 ACWI 的相关性损失训练：
    让“加权后的奖励”与“未来任务表现/未来任务回报”正相关。
 
-   L = -Corr(w_goal_dist*r_goal_dist + w_obs_dist*r_obs_dist + w_apf*r_apf, G_t)
+   L = -Corr(w_goal_progress*r_goal_progress + w_goal_proximity*r_goal_proximity + w_obs_dist*r_obs_dist + w_apf*r_apf, G_t)
        + lambda_reg * L_reg
 
 其中：
@@ -58,13 +59,17 @@ class RewardWeightConfig:
     goal_dist_min: float = 0.1
     goal_dist_max: float = 2.0
 
+    # 目标点接近度奖励权重范围
+    goal_proximity_min: float = 0.05
+    goal_proximity_max: float = 1.5
+
     # 障碍物距离负奖励权重范围
     obs_dist_min: float = 0.1
     obs_dist_max: float = 3.0
 
     # 引力斥力奖励权重范围
     # 注意：APF 权重下限不要太小，避免智能体忽视障碍物斥力
-    apf_min: float = 0.5
+    apf_min: float = 1.0
     apf_max: float = 5.0
 
     # 是否使用 LayerNorm，提高训练稳定性
@@ -84,9 +89,9 @@ class RewardWeightNet(nn.Module):
         如果传入 5 维，会直接使用已有 risk。
 
     输出：
-        weights: Tensor, shape = [batch_size, 3]
+        weights: Tensor, shape = [batch_size, 4]
         顺序：
-        [w_goal_dist, w_obs_dist, w_apf]
+        [w_goal_progress, w_goal_proximity, w_obs_dist, w_apf]
     """
 
     def __init__(self, config: Optional[RewardWeightConfig] = None):
@@ -96,7 +101,7 @@ class RewardWeightNet(nn.Module):
         self.fc1 = nn.Linear(self.config.input_dim, self.config.hidden_dim1)
         self.fc2 = nn.Linear(self.config.hidden_dim1, self.config.hidden_dim2)
         self.fc3 = nn.Linear(self.config.hidden_dim2, self.config.hidden_dim3)
-        self.out = nn.Linear(self.config.hidden_dim3, 3)
+        self.out = nn.Linear(self.config.hidden_dim3, 4)
 
         if self.config.use_layer_norm:
             self.ln1 = nn.LayerNorm(self.config.hidden_dim1)
@@ -160,7 +165,7 @@ class RewardWeightNet(nn.Module):
             features: [batch_size, 4] 或 [batch_size, 5]
 
         返回：
-            weights: [batch_size, 3]
+            weights: [batch_size, 4]
         """
         features = self.compute_risk_from_features(features.float())
 
@@ -170,27 +175,32 @@ class RewardWeightNet(nn.Module):
 
         raw = self.out(x)
 
-        w_goal_dist = self._map_to_range(
+        w_goal_progress = self._map_to_range(
             raw[:, 0:1],
             self.config.goal_dist_min,
             self.config.goal_dist_max,
         )
-        w_obs_dist = self._map_to_range(
+        w_goal_proximity = self._map_to_range(
             raw[:, 1:2],
+            self.config.goal_proximity_min,
+            self.config.goal_proximity_max,
+        )
+        w_obs_dist = self._map_to_range(
+            raw[:, 2:3],
             self.config.obs_dist_min,
             self.config.obs_dist_max,
         )
         w_apf = self._map_to_range(
-            raw[:, 2:3],
+            raw[:, 3:4],
             self.config.apf_min,
             self.config.apf_max,
         )
 
-        weights = torch.cat([w_goal_dist, w_obs_dist, w_apf], dim=-1)
+        weights = torch.cat([w_goal_progress, w_goal_proximity, w_obs_dist, w_apf], dim=-1)
         return weights
 
     @torch.no_grad()
-    def get_weights(self, features) -> Tuple[float, float, float]:
+    def get_weights(self, features) -> Tuple[float, float, float, float]:
         """
         对单个状态输出奖励参数。
 
@@ -203,7 +213,7 @@ class RewardWeightNet(nn.Module):
                 [d_goal, theta_goal, d_obs_min, theta_obs_min, risk]
 
         返回：
-            (w_goal_dist, w_obs_dist, w_apf)
+            (w_goal_progress, w_goal_proximity, w_obs_dist, w_apf)
         """
         self.eval()
         if not torch.is_tensor(features):
@@ -213,7 +223,7 @@ class RewardWeightNet(nn.Module):
 
         device = next(self.parameters()).device
         weights = self.forward(features.to(device)).squeeze(0).cpu().tolist()
-        return weights[0], weights[1], weights[2]
+        return weights[0], weights[1], weights[2], weights[3]
 
     @torch.no_grad()
     def get_batch_weights(self, features: torch.Tensor) -> torch.Tensor:
@@ -224,7 +234,7 @@ class RewardWeightNet(nn.Module):
             features: Tensor, shape = [batch_size, 4] 或 [batch_size, 5]
 
         返回：
-            weights: Tensor, shape = [batch_size, 3]
+            weights: Tensor, shape = [batch_size, 4]
         """
         self.eval()
         device = next(self.parameters()).device
@@ -319,25 +329,30 @@ class DynamicRewardScheduler:
 
         weights = self.compute_weights(features)
 
-        w_goal_dist = weights[:, 0:1]
-        w_obs_dist = weights[:, 1:2]
-        w_apf = weights[:, 2:3]
+        w_goal_progress = weights[:, 0:1]
+        w_goal_proximity = weights[:, 1:2]
+        w_obs_dist = weights[:, 2:3]
+        w_apf = weights[:, 3:4]
 
-        r_goal_dist = self.compute_goal_distance_reward(prev_d_goal, curr_d_goal)
+        r_goal_progress = self.compute_goal_distance_reward(prev_d_goal, curr_d_goal)
+        r_goal_proximity = 1.0 - curr_d_goal
         r_obs_dist = self.compute_obstacle_distance_reward(prev_d_obs_min, curr_d_obs_min)
         r_apf = self.compute_apf_reward(attractive_reward, repulsive_penalty)
 
         total_reward = (
-            w_goal_dist * r_goal_dist
+            w_goal_progress * r_goal_progress
+            + w_goal_proximity * r_goal_proximity
             + w_obs_dist * r_obs_dist
             + w_apf * r_apf
         )
 
         info = {
-            "w_goal_dist": w_goal_dist.detach(),
+            "w_goal_progress": w_goal_progress.detach(),
+            "w_goal_proximity": w_goal_proximity.detach(),
             "w_obs_dist": w_obs_dist.detach(),
             "w_apf": w_apf.detach(),
-            "r_goal_dist": r_goal_dist.detach(),
+            "r_goal_progress": r_goal_progress.detach(),
+            "r_goal_proximity": r_goal_proximity.detach(),
             "r_obs_dist": r_obs_dist.detach(),
             "r_apf": r_apf.detach(),
             "total_reward": total_reward.detach(),
@@ -359,7 +374,7 @@ def generate_rule_based_weight_labels(features: torch.Tensor) -> torch.Tensor:
         兼容：[d_goal, theta_goal, d_obs_min, theta_obs_min, risk]
 
     输出 labels：
-        [w_goal_dist_label, w_obs_dist_label, w_apf_label]
+        [w_goal_progress_label, w_goal_proximity_label, w_obs_dist_label, w_apf_label]
 
     说明：
     - 距离目标较远时，提高目标点距离奖励权重；
@@ -382,7 +397,11 @@ def generate_rule_based_weight_labels(features: torch.Tensor) -> torch.Tensor:
 
     # 这里假设 d_goal 和 d_obs_min 已经过合理归一化
     # d_goal 越大，越需要目标点距离奖励引导
-    w_goal_dist = 0.1 + 1.9 * torch.sigmoid(2.0 * (d_goal - 0.5))
+    w_goal_progress = 0.1 + 1.9 * torch.sigmoid(2.0 * (d_goal - 0.5))
+
+    # 越接近目标，越适当提高接近度 shaping 的权重
+    goal_near = torch.clamp(1.0 - d_goal, 0.0, 1.0)
+    w_goal_proximity = 0.05 + 1.45 * goal_near
 
     # 障碍物越近，越需要提高障碍物距离负奖励权重
     obs_risk = torch.clamp(1.0 - d_obs_min, 0.0, 1.0)
@@ -390,9 +409,9 @@ def generate_rule_based_weight_labels(features: torch.Tensor) -> torch.Tensor:
 
     # 风险越高，越需要强调 APF 中的斥力避障项
     apf_risk = torch.clamp(0.5 * obs_risk + 0.5 * risk, 0.0, 1.0)
-    w_apf = 0.5 + 4.5 * apf_risk
+    w_apf = 1.0 + 4.0 * apf_risk
 
-    labels = torch.cat([w_goal_dist, w_obs_dist, w_apf], dim=-1)
+    labels = torch.cat([w_goal_progress, w_goal_proximity, w_obs_dist, w_apf], dim=-1)
     return labels
 
 
@@ -452,15 +471,15 @@ def compute_weighted_reward(
     根据网络输出的奖励参数，计算加权奖励。
 
     参数：
-        weights: Tensor, shape = [batch_size, 3]
-            [w_goal_dist, w_obs_dist, w_apf]
+        weights: Tensor, shape = [batch_size, 4]
+            [w_goal_progress, w_goal_proximity, w_obs_dist, w_apf]
 
-        reward_components: Tensor, shape = [batch_size, 3]
-            [r_goal_dist, r_obs_dist, r_apf]
+        reward_components: Tensor, shape = [batch_size, 4]
+            [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
 
     返回：
         weighted_reward: Tensor, shape = [batch_size, 1]
-            w_goal_dist*r_goal_dist + w_obs_dist*r_obs_dist + w_apf*r_apf
+            w_goal_progress*r_goal_progress + w_goal_proximity*r_goal_proximity + w_obs_dist*r_obs_dist + w_apf*r_apf
     """
     return torch.sum(weights * reward_components, dim=-1, keepdim=True)
 
@@ -520,7 +539,7 @@ def reward_weight_correlation_loss(
         让“当前权重加权后的奖励”与“未来任务回报”正相关。
 
     数学形式：
-        weighted_reward_t = w_goal_dist*r_goal_dist + w_obs_dist*r_obs_dist + w_apf*r_apf
+        weighted_reward_t = w_goal_progress*r_goal_progress + w_goal_proximity*r_goal_proximity + w_obs_dist*r_obs_dist + w_apf*r_apf
 
         L_corr = -Corr(weighted_reward_t, G_t)
 
@@ -529,17 +548,17 @@ def reward_weight_correlation_loss(
         L = L_corr + lambda_reg * L_reg
 
     参数：
-        weights: Tensor, shape = [batch_size, 3]
-            奖励参数网络输出：[w_goal_dist, w_obs_dist, w_apf]
+        weights: Tensor, shape = [batch_size, 4]
+            奖励参数网络输出：[w_goal_progress, w_goal_proximity, w_obs_dist, w_apf]
 
-        reward_components: Tensor, shape = [batch_size, 3]
-            基础奖励分量：[r_goal_dist, r_obs_dist, r_apf]
+        reward_components: Tensor, shape = [batch_size, 4]
+            基础奖励分量：[r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
 
         future_returns: Tensor, shape = [batch_size] 或 [batch_size, 1]
             未来任务回报 G_t。
 
-        weight_ref: Tensor, shape = [3]
-            权重参考值。默认 [1.0, 1.5, 3.0]。
+        weight_ref: Tensor, shape = [4]
+            权重参考值。默认 [1.0, 0.5, 1.5, 3.0]。
             APF 参考值更大，是为了强调斥力避障安全性。
 
         lambda_reg: float
@@ -572,7 +591,7 @@ def reward_weight_correlation_loss(
     loss_corr = -corr
 
     if weight_ref is None:
-        weight_ref = torch.tensor([1.0, 1.5, 3.0], device=weights.device, dtype=weights.dtype)
+        weight_ref = torch.tensor([1.0, 0.5, 1.5, 3.0], device=weights.device, dtype=weights.dtype)
     else:
         weight_ref = weight_ref.to(device=weights.device, dtype=weights.dtype)
     weight_ref = weight_ref.view(1, -1)
@@ -617,9 +636,9 @@ def train_reward_net_by_correlation(
             推荐：[d_goal, theta_goal, d_obs_min, theta_obs_min]
             兼容：[d_goal, theta_goal, d_obs_min, theta_obs_min, risk]
 
-        reward_components: [N, 3]
-            三个基础奖励分量：
-            [r_goal_dist, r_obs_dist, r_apf]
+        reward_components: [N, 4]
+            四个基础奖励分量：
+            [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
 
         task_rewards 或 future_returns 二选一：
             task_rewards: [N]
@@ -630,7 +649,7 @@ def train_reward_net_by_correlation(
     训练目标：
         最小化：
         L = -Corr(
-              w_goal_dist*r_goal_dist + w_obs_dist*r_obs_dist + w_apf*r_apf,
+              w_goal_progress*r_goal_progress + w_goal_proximity*r_goal_proximity + w_obs_dist*r_obs_dist + w_apf*r_apf,
               G_t
             ) + lambda_reg * L_reg
 
@@ -709,7 +728,7 @@ class OnlineRewardWeightUpdater:
 
     缓存中的单条经验包含：
         features: [d_goal, theta_goal, d_obs_min, theta_obs_min]
-        reward_components: [r_goal_dist, r_obs_dist, r_apf]
+        reward_components: [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
         task_reward: 主任务奖励
         done: episode 是否结束
     """
@@ -748,7 +767,7 @@ class OnlineRewardWeightUpdater:
         self.optimizer = torch.optim.Adam(self.reward_net.parameters(), lr=lr, weight_decay=1e-6)
 
     @torch.no_grad()
-    def get_weights(self, features) -> Tuple[float, float, float]:
+    def get_weights(self, features) -> Tuple[float, float, float, float]:
         """在线推理接口：输入当前状态，输出当前奖励权重。"""
         return self.reward_net.get_weights(features)
 
@@ -854,7 +873,7 @@ def save_reward_net(reward_net: RewardWeightNet, path: str) -> None:
 
 def load_reward_net(path: str, device: str = "cpu") -> RewardWeightNet:
     """加载训练后的奖励参数网络。"""
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     reward_net = RewardWeightNet(checkpoint["config"])
     reward_net.load_state_dict(checkpoint["model_state_dict"])
     reward_net.to(device)
@@ -877,7 +896,7 @@ if __name__ == "__main__":
         goal_dist_max=2.0,
         obs_dist_min=0.1,
         obs_dist_max=3.0,
-        apf_min=0.5,
+        apf_min=1.0,
         apf_max=5.0,
     )
 
@@ -912,10 +931,10 @@ if __name__ == "__main__":
     )
 
     print("动态权重：")
-    print(torch.cat([info["w_goal_dist"], info["w_obs_dist"], info["w_apf"]], dim=-1))
+    print(torch.cat([info["w_goal_progress"], info["w_goal_proximity"], info["w_obs_dist"], info["w_apf"]], dim=-1))
 
     print("基础奖励：")
-    print(torch.cat([info["r_goal_dist"], info["r_obs_dist"], info["r_apf"]], dim=-1))
+    print(torch.cat([info["r_goal_progress"], info["r_goal_proximity"], info["r_obs_dist"], info["r_apf"]], dim=-1))
 
     print("总奖励：")
     print(total_reward)
@@ -925,9 +944,9 @@ if __name__ == "__main__":
     # 实际使用时，把下面的示例数据换成你们采集到的一批经验。
     # ======================================================
 
-    # reward_components = [r_goal_dist, r_obs_dist, r_apf]
+    # reward_components = [r_goal_progress, r_goal_proximity, r_obs_dist, r_apf]
     reward_components = torch.cat(
-        [info["r_goal_dist"], info["r_obs_dist"], info["r_apf"]],
+        [info["r_goal_progress"], info["r_goal_proximity"], info["r_obs_dist"], info["r_apf"]],
         dim=-1,
     )
 
@@ -948,7 +967,7 @@ if __name__ == "__main__":
         batch_size=4,
         lr=5e-4,
         lambda_reg=1e-3,
-        weight_ref=torch.tensor([1.0, 1.5, 3.0]),
+        weight_ref=torch.tensor([1.0, 0.5, 1.5, 3.0]),
         device=device,
     )
 
