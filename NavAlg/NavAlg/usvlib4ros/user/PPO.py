@@ -20,6 +20,7 @@ ACTION_DIM = 2
 OBS_SPACE = (OBS_DIM + ACTION_DIM,)
 ACTION_SPACE = (ACTION_DIM,)
 
+IF_LEARN = True
 
 Transition = namedtuple(
     'Transition',
@@ -154,10 +155,10 @@ class PPO:
         
 
 
-    def log(self, r_sum, explain_var):
+    def log(self, r_sum, explain_var,success_rate):
 
         self.dict["learn_time"] = self.learntime
-        self.dict["arrive_time"] = self.arrive_time
+        self.dict["success_rate"] = success_rate
         self.dict["reward"] = r_sum
         self.dict["explain_var"] = explain_var
 
@@ -177,10 +178,11 @@ class PPO:
                 file_path,
                 index=False
             )
+        return True
 
         
 
-    def learn(self,next_obs,next_done):
+    def learn(self,next_obs,next_done,success_rate):
         self.learntime += 1
         
         r_sum = sum(self.rewards)
@@ -254,11 +256,11 @@ class PPO:
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - self.args.ent_coef * entropy_loss + v_loss * self.args.vf_coef
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.agent.parameters(), self.args.max_grad_norm)
-                self.optimizer.step()
+                if IF_LEARN:
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.agent.parameters(), self.args.max_grad_norm)
+                    self.optimizer.step()
 
             if self.args.target_kl is not None and approx_kl > self.args.target_kl:
                 break
@@ -266,14 +268,16 @@ class PPO:
         y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
-        self.log(r_sum,explained_var)
+        islog = False
+        islog = self.log(r_sum,explained_var,success_rate)
         self.arrive_time = 0
+        return islog
         
     def save(self,model, filepath,total_steps,episode_r,done_time):
         """
         保存 PPO 模型的检查点
         """
-        filepath = os.path.join(filepath, "ppo_%d_reward_%d_goal_%d.pt"%(total_steps,int(episode_r),done_time))
+        filepath = os.path.join(filepath, "ppo_%d.pt"%(self.learntime))
         checkpoint = {
             'model_state_dict': model.state_dict(),          # 保存 actor 和 critic 的网络权重
             'optimizer_state_dict': self.optimizer.state_dict(), # 保存优化器状态（如 Adam 的动量等）
@@ -314,12 +318,8 @@ class PPO:
         result = 1 / (1 + np.exp(-x*4))
         return (result-0.5)*2
     
-    def run(self,next_obs, reward, terminations,global_step,episode_r,arrive,heading_diff):
+    def run(self,next_obs, reward, terminations,global_step,episode_r,success_rate,heading_diff):
         
-
-        if arrive:
-            self.arrive_time +=1
-        print("=============",self.arrive_time)
         step = global_step % self.args.num_steps
         next_done = np.logical_or(terminations,0).astype(int)
         self.rewards[step] = torch.tensor(reward).to(self.device).view(-1)
@@ -335,8 +335,9 @@ class PPO:
         self.obs[step] = next_obs
         self.logprobs[step] = logprob
         print("==========learntime",self.learntime)
+        islog = False
         if step == 0 and global_step > 0:
-            self.learn(next_obs,next_done)
+            islog = self.learn(next_obs,next_done,success_rate)
         if global_step % self.args.save == 0:
-            self.save(self.agent,self.args.file,global_step,episode_r,self.arrive_time)
-        return action_.cpu().numpy()
+            self.save(self.agent,self.args.file,global_step,episode_r,success_rate)
+        return action_.cpu().numpy(),islog

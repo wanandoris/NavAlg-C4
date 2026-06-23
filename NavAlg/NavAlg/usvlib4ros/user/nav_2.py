@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+import cv2
+import os
 
 from usvlib4ros.navigation.usv_ros2_controller import Ros2Controller
 from usvlib4ros.navigation.route_plan_service import RoutePlanService
@@ -12,7 +14,7 @@ from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constant
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
 from usvlib4ros.user.PP0_2 import PPO, device
-from usvlib4ros.user.reward import RewardConfig, compute_reward
+from usvlib4ros.user.reward import RewardConfig
 
 # ==================== 超参数配置 ====================
 N_ACTIONS = 2          # 连续动作空间
@@ -104,6 +106,8 @@ class PPONav:
         self.arrive = False
         self.done = False
         self.arrive_distance = ARRIVE_DISTANCE
+        self.dis_h_w = 1
+        self.dis_r_w = 1
 
         self.routePlaneService = RoutePlanService(
             wayPointRadius=self.arrive_distance, route=self.route
@@ -184,7 +188,8 @@ class PPONav:
 
                     # 定期保存模型
                     if epoch % CHECKPOINT_INTERVAL == 0:
-                        checkpoint_path = f"./PPO_ship_obstacle_{epoch}.pth"
+                        filepath = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models"
+                        checkpoint_path = os.path.join(filepath, "ppo_%d.pt"%(epoch))
                         self.ppo_agent.save(checkpoint_path)
                         LogUtil.info(f"模型已保存: {checkpoint_path}")
 
@@ -284,6 +289,12 @@ class PPONav:
             math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(delta_lon))
         bearing_rad = math.atan2(y, x)
         bearing_deg = (math.degrees(bearing_rad) + 360) % 360
+        if bearing_deg>180:
+            bearing_deg = bearing_deg - 360
+            
+        heading = self._get_current_heading()
+        
+        bearing_deg = self._normalize_signed_angle_diff(bearing_deg - heading)
         return bearing_deg
 
     @staticmethod
@@ -293,6 +304,196 @@ class PPONav:
     @staticmethod
     def _normalize_signed_angle_diff(angle: float) -> float:
         return (angle + 180) % 360 - 180
+
+    def set_reward_v1(self, state,action,heading,distance):
+        obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
+
+        
+        dis_r = 0
+        self.dis_h_w *=0.996
+        self.dis_h_w -= 0.0002
+        dis_r = abs(30 - distance)/30*2
+        heading_r = math.cos(math.pi * self.sigmoid_v1(heading/30)) * 1.5 #===-1~1   #=============或许要改 
+        if self.arrive:
+            LogUtil.info("Goal!!")
+            dis_r += 1000
+        if distance<1.5 :
+            dis_r = (4-distance)**4
+            self.dis_r_w *=0.97
+            self.dis_r_w -= 0.005
+        dis_r *= self.dis_r_w
+        heading_r *= self.dis_h_w
+        speed_r = action[0,0]
+        print("=========speed",speed_r)
+        reard = heading_r + dis_r + speed_r
+        self.show_reward(
+    heading,
+    distance,
+    heading_r,
+    0,
+    0,
+    reard,
+    dis_r,
+    self.dis_r_w
+)
+        return reard
+    def show_reward(
+    self,
+    heading,
+    distance,
+    heading_r,
+    speed_r,
+    obstacle_r,
+    reward,
+    dis_r,
+    dis_r_w
+):
+
+        img = np.zeros((400, 600, 3), dtype=np.uint8)
+
+        cv2.putText(img,
+            f"heading: {heading:.2f}",
+            (20,50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255,255,255),
+            2)
+
+        cv2.putText(img,
+            f"distance: {distance:.2f}",
+            (20,100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255,255,255),
+            2)
+
+        cv2.putText(img,
+            f"heading_r: {heading_r:.2f}",
+            (20,180),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0,255,0),
+            2)
+
+        cv2.putText(img,
+            f"speed_r_w: {speed_r:.2f}",
+            (20,230),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0,255,0),
+            2)
+
+        cv2.putText(img,
+            f"obstacle_r: {obstacle_r:.2f}",
+            (20,280),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0,255,255),
+            2)
+
+        cv2.putText(img,
+            f"TOTAL: {reward:.2f}",
+            (20,350),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0,0,255),
+            2)
+        cv2.putText(img,
+            f"dis_r: {dis_r:.2f}",
+            (300,350),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0,0,255),
+            2)
+        cv2.putText(img,
+            f"dis_r_W: {dis_r_w:.2f}",
+            (250,100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0,0,255),
+            2)
+
+        cv2.imshow("Reward Monitor", img)
+        cv2.waitKey(1)
+    def set_reward_v2(self, state,action,heading,distance):
+        obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
+
+        
+        dis_r = 0
+        self.dis_h_w *=0.996
+        self.dis_h_w -= 0.0002
+        dis_r = (abs(30 - distance)/30)**2
+        heading_r = math.cos(math.pi * self.sigmoid_v1(heading/30)) * 1.5 #===-1~1   #=============或许要改 
+        if self.arrive:
+            LogUtil.info("Goal!!")
+            dis_r += 1000
+        
+        if distance<1.5 :
+            dis_r = (4-distance)**4
+            self.dis_r_w *=0.97
+            self.dis_r_w -= 0.005
+        dis_r *= self.dis_r_w
+        heading_r *= self.dis_h_w
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
+        speed_r = action/100
+        print("==============speedr",speed_r)
+        reard = heading_r + dis_r + speed_r - obstacle_r
+        if self.done:
+            LogUtil.info("Collision!!")
+            reard += -500
+        self.show_reward(
+    heading,
+    distance,
+    heading_r,
+    self.dis_h_w,
+    obstacle_r,
+    reard,
+    dis_r,
+    self.dis_r_w
+        )
+        return reard
+    
+    def normalize_feature(self,feat: np.ndarray):
+        """逐样本 0均值1方差规范化 (Z-Score)"""
+        # 计算均值和标准差，利用 keepdims=True 保持维度以便广播相减/除
+        mean = np.mean(feat, axis=-1, keepdims=True)
+        std = np.std(feat, axis=-1, keepdims=True) + 1e-6  # 防除零
+        
+        feat_norm = (feat - mean) / std
+        return feat_norm
+    def binary_cross_entropy_v1(self,y_true, y_pred):
+        """计算二分类交叉熵损失的2次方"""
+        epsilon = 1e-15
+        # 防止 log(0) 导致数值溢出
+        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+        loss = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+        return loss*loss
+    def binary_cross_entropy(self,y_true, y_pred):
+        """计算二分类交叉熵损失"""
+        epsilon = 1e-15
+        # 防止 log(0) 导致数值溢出
+        y_pred = np.clip(y_pred, epsilon, 1 - epsilon)
+        loss = -np.mean(y_true * np.log(y_pred) + (1 - y_true) * np.log(1 - y_pred))
+        return loss
+    def sigmoid_v1(self,x):
+        """
+        对于结果进行处理，最后为-1~1
+        Sigmoid 激活函数（包含数值稳定性优化）
+        :param x: 输入值（可以是标量、列表或 NumPy 数组）
+        :return: 经过 Sigmoid 处理后的输出，范围在 (0, 1) 之间
+        """
+        result = 1 / (1 + np.exp(-x))
+        return (result-0.5)*2
+    
+    def sigmoid(self,x):
+        """
+        
+        Sigmoid 激活函数（包含数值稳定性优化）
+        :param x: 输入值（可以是标量、列表或 NumPy 数组）
+        :return: 经过 Sigmoid 处理后的输出，范围在 (0, 1) 之间
+        """
+        result = 1 / (1 + np.exp(-x))
+        return result
 
     def _calc_distance_to_target(self, lng1: float, lat1: float, lng2: float, lat2: float) -> float:
         rad_lat1 = math.radians(lat1)
@@ -332,15 +533,7 @@ class PPONav:
         # 获取新状态
         pose = self.global_data.scada_data.pose
         new_state = self.getState(laser_scan, heading, shipToNextWPDistance, degreeAship, pose.speed, pose.rotate_speed)
-        reward = compute_reward(
-            state=new_state,
-            action=action,
-            max_distance=max_distance,
-            angle_diff=new_state[-4],
-            arrive=self.arrive,
-            done=self.done,
-            config=self.reward_config,
-        )
+        reward = self.set_reward_v2(new_state,adviseSpeed,degreeAship,shipToNextWPDistance)
         if self.arrive:
             LogUtil.info("到达目标!")
         elif self.done:

@@ -37,7 +37,7 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 MAX_EPOCH = 4000
 
 LASER_MAX_RANGE = 10.0        # 激光雷达有效最大距离(m)
-COLLISION_DISTANCE = 1     # 碰撞判定阈值(m)
+COLLISION_DISTANCE = 0.7    # 碰撞判定阈值(m)
 
 LOAD_MODEL_STEP = 10         #要加载的模型名称最后step的数字
 
@@ -65,7 +65,7 @@ class PPO_NAV:
         self.navThread = None
 
         #模型
-        self.ppo_agent = PPO(ifload=False,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models\\ppo_2048_reward_-443_goal_0.pt")
+        self.ppo_agent = PPO(ifload=True,file_path = "D:\\大赛资源\\智能导航C4-2026\\unpack\\NavAlg-C4-v1\\ppo_models\\ppo_4.pt")
         self.next_state = None
         self.action_size = 5 #动作空间
         self.isbug = 0
@@ -80,11 +80,16 @@ class PPO_NAV:
         self.episode_reward_sum = 0     # 本轮总分数
         self.arrive = False     # 到达
         self.done = False       # 碰撞障碍或越界
-        self.arrive_distance = 1.0     # 最小距离，船到目标的距离低于此值时，认为到达目标。
-        self.dis_r_w = 1
+        
+        self.arrive_distance = 1.5     # 最小距离，船到目标的距离低于此值时，认为到达目标。
+        self.dis_r_w = 1.0
+        self.dis_h_w = 1.0
         #=============碰撞判定超参数在上边
         self.arrive_time = []
+        self.total_result = [0]
         self.last_heading = 0
+        self.last_dis = 0
+        self.dis_w = 1
         
         self.routePlaneService = RoutePlanService(wayPointRadius=self.arrive_distance, route=self.route)
         """启动时缓存下当前激光雷达数据，算法中检测激光雷达数据对象是否变化来判断是否收到新的数据"""
@@ -102,7 +107,8 @@ class PPO_NAV:
     obstacle_r,
     reward,
     dis_r,
-    dis_r_w
+    dis_r_w,
+    dis_w
 ):
 
         img = np.zeros((400, 600, 3), dtype=np.uint8)
@@ -132,7 +138,7 @@ class PPO_NAV:
             2)
 
         cv2.putText(img,
-            f"speed_r: {speed_r:.2f}",
+            f"dis_h_w: {speed_r:.2f}",
             (20,230),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -164,6 +170,13 @@ class PPO_NAV:
         cv2.putText(img,
             f"dis_r_W: {dis_r_w:.2f}",
             (250,100),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.2,
+            (0,0,255),
+            2)
+        cv2.putText(img,
+            f"dis_W: {dis_w:.2f}",
+            (300,200),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.2,
             (0,0,255),
@@ -336,6 +349,8 @@ class PPO_NAV:
                     startTime = time.time()
                     self.isbug = 0
                     self.dis_r_w = 1
+                    self.dis_h_w = 1
+                    self.dis_w = 1
                     for t in range(500):
                         if self.global_data.device_data.task_status == 0:
                             """unity端 训练模式，点击了停止训练按钮"""
@@ -357,7 +372,7 @@ class PPO_NAV:
                         #self._check_route_update()   #=========================新增，测试是否获取障碍点
 
                         self.navigationHandler(self.next_state,e,t,global_step,e)
-                        time.sleep(0.1)
+                        time.sleep(0.2)
                         
 
                         """monitor parameter data update by this thread"""
@@ -421,7 +436,7 @@ class PPO_NAV:
             self.arrive = True
             self.arrive_time.append(1)
         print("==============",self.arrive_time)
-        #scan_range = self.normalize_feature(scan_range)  #正则化
+        
         return np.append(scan_range , [heading, current_distance, obstacle_min_range, obstacle_angle])   #乘上一个数是为了让模型放更大的注意在这些参数上
 
     def getState_v1(self, scan,heading,current_distance):
@@ -459,7 +474,7 @@ class PPO_NAV:
         #scan_range = self.normalize_feature(scan_range)  #正则化
         
         scan_range = self._extract_laser_features_v1(scan)
-        return np.append(scan_range , [heading, current_distance, 10, obstacle_angle])   #乘上一个数是为了让模型放更大的注意在这些参数上
+        return np.append(scan_range , [heading, current_distance, obstacle_min_range, obstacle_angle])   #乘上一个数是为了让模型放更大的注意在这些参数上
     
     
     def judge_stage(self):
@@ -470,15 +485,17 @@ class PPO_NAV:
         3     8~10
         """
         if len(self.arrive_time) % 10 ==0 :
-            self.arrive_time = []
-            if self.arrive_time.count(1)>3:
-                if self.arrive_time.count(1)>7:
-                    return 3
+            self.total_result.extend(self.arrive_time)
+            
+            if self.arrive_time.count(1)>4:
+                
+                self.arrive_time = []
                 return 2
+            self.arrive_time = []
         return 1
     
     # step函数是用于执行一个动作并观察环境反馈的函数。它接收一个动作作为输入，并返回执行该动作后的新状态、奖励和完成标志。
-    def step_v1(self, state, action, laser_scan, heading, shipToNextWPDistance):
+    def step_v1(self, state, action, laser_scan, heading, shipToNextWPDistance,a):
         """
         state: 状态空间
         action：随机动作
@@ -492,11 +509,11 @@ class PPO_NAV:
         
            
         state = self.getState_v1(laser_scan, heading, shipToNextWPDistance)     #雷达无效输出
-
-        reward = self.set_reward_v1(state,action,heading,shipToNextWPDistance)  #无障碍
+        
+        reward = self.set_reward_v2(state,action,heading,shipToNextWPDistance,a)  #无障碍
 
         return state, reward,  heading
-    def step_v2(self, state, action, laser_scan, heading, shipToNextWPDistance):
+    def step_v2(self, state, action, laser_scan, heading, shipToNextWPDistance,a):
         """
         state: 状态空间
         action：随机动作
@@ -509,8 +526,8 @@ class PPO_NAV:
         
            
         state = self.getState(laser_scan, heading, shipToNextWPDistance)
-
-        reward = self.set_reward_v2(state,action,heading,shipToNextWPDistance)    #增加障碍
+        
+        reward = self.set_reward_v2(state,action,heading,shipToNextWPDistance,a)    #增加障碍
 
         return state, reward,  heading
     def step_v3(self, state, action, laser_scan, heading, shipToNextWPDistance):
@@ -767,24 +784,27 @@ class PPO_NAV:
                 state = self.getState(laser_scan, heading, shipToNextWPDistance)
                 
             heading_diff = heading - self.last_heading
-            action= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,self.arrive,heading_diff)
+            success_rate = self.total_result.count(1)/len(self.total_result)
+            action,islog= self.ppo_agent.run(state,self.reward,self.done or self.arrive,global_step,self.episode_reward_sum,success_rate,heading_diff)
             #=============================在SAC里做正则，因为这里的state的后继维度还有用
             self.last_heading = heading
-            
+            # if islog:
+            #     self.total_result = [0]
             adviseSpeed = action[0,0]*100
             adviseRotate = action[0,1]*100
             stage = self.judge_stage()
+            a = True
+            if step < 30 :
+                a = False
             if stage == 1 : 
                 self.next_state, self.reward, advisedHeading, =\
-                    self.step_v1(state.tolist(),action,laser_scan,heading, shipToNextWPDistance)
+                    self.step_v1(state.tolist(),action,laser_scan,heading, shipToNextWPDistance,a)
             elif stage ==2 :
                 self.next_state, self.reward, advisedHeading, =\
-                    self.step_v2(state.tolist(),action,laser_scan,heading, shipToNextWPDistance)
-            elif stage ==3 :
-                self.next_state, self.reward, advisedHeading, =\
-                    self.step_v3(state.tolist(),action,laser_scan,heading, shipToNextWPDistance)
+                    self.step_v2(state.tolist(),action,laser_scan,heading, shipToNextWPDistance,a)
+            
                 
-                
+            print(self.total_result)
             #self.ppo_agent.anneal_lr(self.episode_reward_sum)         #依据奖励调整学习率
             self.episode_reward_sum += self.reward
 
@@ -822,11 +842,12 @@ class PPO_NAV:
         if distance<=5:
             obstacle_r = 0
         
-        reward = heading_r+speed_r-obstacle_r     #朝向+速度（较小）-障碍距离
         if self.arrive:
             LogUtil.info("Goal!!")
-            reward += 100
-        elif self.done:
+            dis_r += 1000
+        dis_r *= self.dis_r_w
+        reard = heading_r + dis_r - obstacle_r
+        if self.done:
             LogUtil.info("Collision!!")
             reward += -100
         #reward = self.sigmoid_v1(reward/2.5)
@@ -848,31 +869,38 @@ class PPO_NAV:
 
         
         dis_r = 0
-        if distance<1.5 :
-            self.dis_r_w *=0.95
-            self.dis_r_w -= 0.01
+
+        dis_r = abs(30 - distance)/30*2
+        heading_r = math.cos(math.pi * self.sigmoid_v1(heading/30)) * 1.5 #===-1~1   #=============或许要改 
+        
+        if distance<3 :
             dis_r = (4-distance)**4
-        heading_r = self.sigmoid_v1(5-abs(heading/6))*2  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
-        if heading_r<0:
-            heading_r =heading_r/5 
+            self.dis_r_w *=0.97
+            self.dis_r_w -= 0.005
+        heading_r *= self.dis_h_w
+       
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)/2
+
         if self.arrive:
             LogUtil.info("Goal!!")
             dis_r += 1000
         dis_r *= self.dis_r_w
-        speed_r = action[0,0]
-        print("=========speed",speed_r)
-        reard = heading_r + dis_r + speed_r
+        reard = heading_r + dis_r - obstacle_r
+
+        if self.done:
+            LogUtil.info("Collision!!")
+            reard += -500
         self.show_reward(
     heading,
     distance,
     heading_r,
-    0,
-    0,
+    self.dis_h_w,
+    obstacle_r,
     reard,
     dis_r,
     self.dis_r_w
 )
-        return reard
+        return float(reard)
     # def set_reward_v2(self, state,action,heading,distance):
     #     dis_r = 0
     #     if distance<1.5 :
@@ -893,41 +921,53 @@ class PPO_NAV:
     #     print("======heading_r",heading_r,"====dis_r",dis_r,"====dis_w",self.dis_r_w)
 
     #     return reard
-    def set_reward_v2(self, state,action,heading,distance):
+    def set_reward_v2(self, state,action,heading,distance,a):
         obstacle_min_range = state[-2]         #====我觉得可以不加，因为撞击后扣得已经够模型受得了
 
+        
         dis_r = 0
-        if distance<1.5 :
-            self.dis_r_w *=0.97
+        self.dis_h_w *=0.996
+        self.dis_h_w -= 0.0002
+        heading_r = math.cos(math.pi * self.sigmoid_v1(heading/30)) * 1.5 #===-1~1   #=============或许要改 
+        
+        
+        if distance<6 :
+            dis_r = (6-distance)/2
+            
+        self.dis_r_w *=0.995
+        
+        heading_r *= self.dis_h_w
+        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)/2
 
-            dis_r = (4-distance)**4
-        heading_r = self.sigmoid_v1(5-abs(heading/6))*2  #===-1~1，对准时在0.9左右     45度为奖励0        #=============或许要改
-        if heading_r<0:
-            heading_r =heading_r/5 
         if self.arrive:
             LogUtil.info("Goal!!")
             dis_r += 1000
-        elif self.done:
-            LogUtil.info("Collision!!")
-            reward += -500
         dis_r *= self.dis_r_w
-        speed_r = action[0,0]
-        obstacle_r = self.binary_cross_entropy_v1(0,(10-obstacle_min_range+0.9)/10)
+        if distance >=self.last_dis:
+                self.dis_w -= 0.004
+                obstacle_r += 3
+        reward_= self.dis_w*(heading_r + dis_r)
+        reard = reward_ - obstacle_r
+        
+        
+        
+        self.last_dis = distance
 
-        print("==============speedr",speed_r)
-        reard = heading_r + dis_r + speed_r - obstacle_r
-
+        if self.done and a:
+            LogUtil.info("Collision!!")
+            reard += -500
         self.show_reward(
     heading,
     distance,
     heading_r,
-    0,
+    self.dis_h_w,
     obstacle_r,
     reard,
     dis_r,
-    self.dis_r_w
+    self.dis_r_w,
+    self.dis_w
         )
-        return reard
+        return float(reard)
     
     def normalize_feature(self,feat: np.ndarray):
         """逐样本 0均值1方差规范化 (Z-Score)"""
