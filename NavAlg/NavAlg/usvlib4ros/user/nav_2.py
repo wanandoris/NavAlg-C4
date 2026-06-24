@@ -15,11 +15,9 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
-from usvlib4ros.user.episode_logging import EpisodeDataLogger
 from usvlib4ros.user.pid_controller import PID, PIDConfig
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown, calc_apf_heading_diff
-from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter, build_tensorboard_log_dir
 from usvlib4ros.user.training_logger import TrainingLogger
 
 # ==================== PPO相关 ====================
@@ -35,27 +33,27 @@ ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
 UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
 MIN_BUFFER_SIZE_FOR_UPDATE = 256
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
-TEACHER_EPSILON_DECAY = 0.008  # APF-PID作为专家的概率衰减系数
-TEACHER_EPSILON_MIN = 0.20    # 专家概率下限
+TEACHER_EPSILON_DECAY = 0.001  # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.10    # 专家概率下限
 
 # ==================== 奖励相关 ====================
 REWARD_ARRIVE_BONUS = 80
 REWARD_COLLISION_PENALTY = -50
-REWARD_WEIGHT_DISTANCE = 2.4
-REWARD_WEIGHT_OBSTACLE = 0.9
-REWARD_WEIGHT_HEADING = 1.0
+REWARD_WEIGHT_DISTANCE = 1
+REWARD_WEIGHT_OBSTACLE = 0.6
+REWARD_WEIGHT_HEADING = 0.6
 REWARD_WEIGHT_TIME = 0.2
 REWARD_PROGRESS_SCALE = 14.0
 REWARD_PROGRESS_WEIGHT = 0.7
 REWARD_PROXIMITY_WEIGHT = 0.3
-REWARD_PROXIMITY_EXPONENT = 2.4
+REWARD_PROXIMITY_EXPONENT = 1.5
 REWARD_PROXIMITY_NORMALIZER = 12.0
 REWARD_STEP_PENALTY = -0.005
 REWARD_MIN_ARRIVE_TIME_WEIGHT = 0.35
 REWARD_APF_ATTRACTIVE_GAIN = 1.0
 REWARD_APF_REPULSIVE_GAIN = 8.0
 REWARD_APF_OBSTACLE_INFLUENCE_RANGE = 2.5
-REWARD_TIME_EXPONENT = 1.4
+REWARD_TIME_EXPONENT = 1.5
 
 # ==================== 导航/PID 相关 ====================
 LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
@@ -79,20 +77,23 @@ MAX_EPOCH = 4000       # 最大训练轮数
 MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)（同样与时间刻相关）
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
+IS_LOAD = False
+NETWORK_PATH = r"D:\C4\Results\ppo_nav_latest\checkpoints\PPO_ship_obstacle_latest.pth"
 MAX_RESET_RETRIES = 5
 ENABLE_APF_DEBUG_VIEW = False         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 
 # ==================== 时间刻 ====================
-TASK_WAIT_SLEEP = 0.01          # 等待训练触发轮询间隔(秒)
-EMPTY_ROUTE_SLEEP = 0.01        # 航线为空时的等待间隔(秒)
-STEP_SLEEP = 0.01               # 每步主循环结束等待间隔(秒)
-FINAL_SLEEP = 0.2               # 异常/结束后的等待间隔(秒)
-RESET_START_SLEEP = 0.01        # reset_unity后首次等待(秒)
-RESET_STATUS_SLEEP = 0.01       # 等待reset_status轮询间隔(秒)
-LASER_TIMEOUT = 0.2             # 等待激光数据超时(秒)
-LASER_POLL_SLEEP = 0.01         # 激光轮询间隔(秒)
-RESET_SETTLE_DELAY = 0.2        # 每轮复位后等待仿真刷新(秒)
+TIME_RATE = 2
+TASK_WAIT_SLEEP = 0.1 / TIME_RATE         # 等待训练触发轮询间隔(秒)
+EMPTY_ROUTE_SLEEP = 0.1 / TIME_RATE       # 航线为空时的等待间隔(秒)
+STEP_SLEEP = 0.1 / TIME_RATE              # 每步主循环结束等待间隔(秒)
+FINAL_SLEEP = 2 / TIME_RATE               # 异常/结束后的等待间隔(秒)
+RESET_START_SLEEP = 0.1 / TIME_RATE       # reset_unity后首次等待(秒)
+RESET_STATUS_SLEEP = 0.1 / TIME_RATE      # 等待reset_status轮询间隔(秒)
+LASER_TIMEOUT = 2 / TIME_RATE             # 等待激光数据超时(秒)
+LASER_POLL_SLEEP = 0.1 / TIME_RATE        # 激光轮询间隔(秒)
+RESET_SETTLE_DELAY = 2 / TIME_RATE       # 每轮复位后等待仿真刷新(秒)
 
 
 @dataclass
@@ -130,11 +131,6 @@ class PPONav:
         self.global_data: GlobalData = global_data
         self.navThread = None
         self.current_episode_step = 0
-        self.tb_log_dir = build_tensorboard_log_dir(Path.cwd() / "runs")
-        self.tb_writer = TensorBoardMetricsWriter(log_dir=self.tb_log_dir)
-        self.enable_episode_logging = False
-        self.episode_log_dir = Path.cwd() / "logs"
-        self.episode_logger = None
 
         self.training_logger = TrainingLogger(root_dir="Results")
 
@@ -144,9 +140,14 @@ class PPONav:
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
-            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT,
-            writer=self.tb_writer.writer
+            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT
         )
+        if IS_LOAD:
+            checkpoint_path = Path(NETWORK_PATH)
+            if not checkpoint_path.is_file():
+                raise FileNotFoundError(f"PPO checkpoint not found: {checkpoint_path}")
+            self.ppo_agent.load(str(checkpoint_path))
+            LogUtil.info(f"已加载PPO模型: {checkpoint_path}")
         self.next_state = None
         # 航线相关
         self.route = None
@@ -230,7 +231,6 @@ class PPONav:
 
                     try:
                         LogUtil.info(f"第 {epoch} 轮训练开始")
-                        self._start_episode_logging(epoch)
                         last_update_metrics = None
                         self.teacher_prob = self._calc_teacher_probability(epoch)
 
@@ -278,13 +278,9 @@ class PPONav:
                             self.setMonitorParameterValue()
 
                             if self.done or self.arrive:
-                                self._log_episode_metrics(epoch)
                                 break
 
                             time.sleep(STEP_SLEEP)
-
-                        if not self.done and not self.arrive and self.current_episode_step > 0:
-                            self._log_episode_metrics(epoch)
 
                         last_update_metrics = (
                             self._try_update_ppo(
@@ -310,14 +306,11 @@ class PPONav:
                             timeout=self.timeout and not self.done and not self.arrive,
                             last_update_metrics=last_update_metrics,
                         )
-                    finally:
-                        self._close_episode_logging()
-
+                    except Exception as e:
+                        LogUtil.error(f"第 {epoch} 轮训练异常: {e}")
             except Exception as e:
                 LogUtil.error(e)
             finally:
-                self._close_episode_logging()
-                self._close_tensorboard_writer()
                 self.training_logger.close()
                 time.sleep(FINAL_SLEEP)
 
@@ -875,7 +868,6 @@ class PPONav:
             self._draw_debug_arrow(canvas, center, 195, self._normalize_heading_360(self.last_heading_debug["ppo_target_heading"]), (180, 120, 40), "ppo_pred")
             self._draw_debug_arrow(canvas, center, 215, self._normalize_heading_360(self.last_heading_debug["pid_target_heading"]), (0, 150, 150), "apf_pred")
             self._draw_debug_arrow(canvas, center, 235, self._normalize_heading_360(self.last_heading_debug["selected_target_heading"]), (120, 60, 180), "selected")
-            self._draw_debug_arrow(canvas, center, 220, heading_world + curr_apf_heading_diff, (30, 80, 220), "apf_now")
             self._draw_debug_arrow(canvas, center, 150, heading_world + predicted_apf_heading_diff, (180, 60, 180), "apf_next")
 
             laser_count = max(0, len(new_state) - 6)
@@ -982,8 +974,6 @@ class PPONav:
             if laser_scan is None:
                 return False
 
-            self._log_episode_snapshot(pose_info, nav_context, laser_scan)
-
             # 4. 执行PPO决策循环
             done = self._ppo_decision_loop(state, episode, step, laser_scan, nav_context)
 
@@ -1059,84 +1049,6 @@ class PPONav:
         self.last_laser_scan = laser_scan
         return laser_scan
 
-    def _log_episode_snapshot(self, pose_info: tuple, nav_context: dict, laser_scan: Any):
-        if not self.enable_episode_logging or self.episode_logger is None:
-            return
-        obstacle = self._build_obstacle_snapshot(laser_scan, pose_info[4])
-        target = self._point_to_dict(self.destPoint)
-        ship = {
-            "lng": pose_info[2],
-            "lat": pose_info[3],
-        }
-        laser = list(getattr(laser_scan, "ranges", []) or [])
-        self.episode_logger.log_snapshot(
-            obstacle=obstacle,
-            target=target,
-            ship=ship,
-            laser=laser,
-        )
-
-    def _start_episode_logging(self, episode: int):
-        if not self.enable_episode_logging:
-            return
-        if self.episode_logger is None:
-            self.episode_logger = EpisodeDataLogger(self.episode_log_dir)
-        self.episode_logger.start_episode(episode)
-
-    def _close_episode_logging(self):
-        if self.episode_logger is None:
-            return
-        self.episode_logger.close()
-
-    def _build_obstacle_snapshot(self, laser_scan: Any, heading: float) -> dict:
-        ranges = list(getattr(laser_scan, "ranges", []) or [])
-        if not ranges:
-            return {"lng": None, "lat": None, "distance": None, "angle": None}
-
-        valid_points = []
-        for index, value in enumerate(ranges):
-            if value in (None, float("Inf")):
-                continue
-            if isinstance(value, float) and np.isnan(value):
-                continue
-            if value <= 0 or value > LASER_MAX_RANGE:
-                continue
-            valid_points.append((index, float(value)))
-
-        if not valid_points:
-            return {"lng": None, "lat": None, "distance": None, "angle": None}
-
-        min_index, min_distance = min(valid_points, key=lambda item: item[1])
-        heading_rad = math.radians(heading)
-        angle_increment = self._safe_float(getattr(laser_scan, "angle_increment", 0.0))
-        angle_min = self._safe_float(getattr(laser_scan, "angle_min", 0.0))
-        relative_angle = angle_min + min_index * angle_increment
-        world_angle = heading_rad + relative_angle
-        relative_angle_deg = math.degrees(relative_angle)
-
-        return {
-            "lng": round(min_distance * math.cos(world_angle), 6),
-            "lat": round(min_distance * math.sin(world_angle), 6),
-            "distance": round(min_distance, 6),
-            "angle": round(relative_angle_deg, 6),
-        }
-
-    @staticmethod
-    def _point_to_dict(point: Any) -> dict:
-        if point is None:
-            return {"lng": None, "lat": None}
-        return {
-            "lng": getattr(point, "lng", None),
-            "lat": getattr(point, "lat", None),
-        }
-
-    @staticmethod
-    def _safe_float(value: Any) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
     def _ppo_decision_loop(self, state, episode: int, step: int,
                        laser_scan, nav_context: dict) -> bool:
         """PPO核心决策逻辑。"""
@@ -1170,13 +1082,6 @@ class PPONav:
         self.ppo_agent.buffer.rewards.append(result.reward)
         self.ppo_agent.buffer.is_terminals.append(self.done)
         self.episode_reward_sum += result.reward
-
-        if self.tb_writer is not None:
-            if self.rotate_control_mode == "PPO":
-                self.tb_writer.add_scalar("heading/ppo_target", result.ppo_target_heading, self.current_episode_step)
-            self.tb_writer.add_scalar("heading/apf_target", result.pid_target_heading, self.current_episode_step)
-            self.tb_writer.add_scalar("heading/selected_target", result.selected_target_heading, self.current_episode_step)
-            self.tb_writer.flush()
 
         # 输出控制量（修复点：补全参数）
         self._output_control_commands(result, episode, step, nav_context['nextPointIndex'])
@@ -1213,6 +1118,13 @@ class PPONav:
             episode, step, int(self.episode_reward_sum),
             result.reward, MAX_EPOCH, 2
         )
+        self.global_data.updateThrottleRudderOutput(
+            result.advise_speed,
+            result.advise_rotate,
+            result.advised_heading,
+            nextPointIndex,
+            result.current_distance,
+        )
 
     def _log_navigation_result(self, nav_context: dict):
         """记录导航结果日志。"""
@@ -1220,25 +1132,6 @@ class PPONav:
             f"航点={self.destPointIndex} 距离={nav_context['shipToNextWPDistance']:.1f}m "
             f"速度=... 转向=..."
         )
-
-    def _log_episode_metrics(self, episode: int):
-        if self.tb_writer is None:
-            return
-        self.tb_writer.log_episode(
-            episode=episode,
-            reward=self.episode_reward_sum,
-            length=self.current_episode_step,
-        )
-
-    def _close_tensorboard_writer(self):
-        if self.tb_writer is None:
-            return
-        try:
-            self.tb_writer.close()
-        except Exception as exc:
-            LogUtil.error(f"关闭TensorBoard writer失败: {exc}")
-        finally:
-            self.tb_writer = None
 
     # ==================== 参数注册 ====================
 

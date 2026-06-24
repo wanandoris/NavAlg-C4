@@ -5,8 +5,6 @@ import numpy as np
 import math
 from torch.distributions import Categorical, MultivariateNormal
 
-from usvlib4ros.user.tensorboard_logging import TensorBoardMetricsWriter
-
 logger = logging.getLogger(__name__)
 
 # Device configuration
@@ -200,7 +198,6 @@ class PPO:
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         self.mse_loss = nn.MSELoss()   # 用于 Critic 的损失函数
-        self.tb_writer = TensorBoardMetricsWriter(writer=writer) if writer is not None else None
         self.update_step = 0
         self.min_update_buffer_size = 128
 
@@ -304,16 +301,6 @@ class PPO:
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-        if self.tb_writer is not None:
-            self.tb_writer.log_update(
-                self.update_step,
-                total_loss_value,
-                actor_loss_value,
-                critic_loss_value,
-                entropy_value,
-                ratio_mean_value,
-                advantage_mean_value,
-            )
         self.update_step += 1
 
         # 更新完成后,将旧策略网络同步为当前策略网络
