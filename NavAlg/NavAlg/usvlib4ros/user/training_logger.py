@@ -112,8 +112,12 @@ class TrainingLogger:
                 "buffer_size",
                 "actor_loss",
                 "critic_loss",
+                "aux_loss",
                 "total_loss",
                 "entropy",
+                "grad_norm",
+                "sequence_count",
+                "mean_sequence_len",
                 "total_episodes",
                 "success_rate_total",
                 "collision_rate_total",
@@ -130,8 +134,12 @@ class TrainingLogger:
                 "buffer_size",
                 "actor_loss",
                 "critic_loss",
+                "aux_loss",
                 "total_loss",
                 "entropy",
+                "grad_norm",
+                "sequence_count",
+                "mean_sequence_len",
             ],
         )
 
@@ -154,16 +162,24 @@ class TrainingLogger:
             "buffer_size": update_metrics.get("buffer_size"),
             "actor_loss": update_metrics.get("actor_loss"),
             "critic_loss": update_metrics.get("critic_loss"),
+            "aux_loss": update_metrics.get("aux_loss"),
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
+            "grad_norm": update_metrics.get("grad_norm"),
+            "sequence_count": update_metrics.get("sequence_count"),
+            "mean_sequence_len": update_metrics.get("mean_sequence_len"),
         }
         row = [
             row_dict["update_step"],
             row_dict["buffer_size"],
             row_dict["actor_loss"],
             row_dict["critic_loss"],
+            row_dict["aux_loss"],
             row_dict["total_loss"],
             row_dict["entropy"],
+            row_dict["grad_norm"],
+            row_dict["sequence_count"],
+            row_dict["mean_sequence_len"],
         ]
         self._update_rows.append(row_dict)
         self._append_csv_row(self.update_csv_path, row)
@@ -173,8 +189,12 @@ class TrainingLogger:
             "buffer_size": update_metrics.get("buffer_size"),
             "actor_loss": update_metrics.get("actor_loss"),
             "critic_loss": update_metrics.get("critic_loss"),
+            "aux_loss": update_metrics.get("aux_loss"),
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
+            "grad_norm": update_metrics.get("grad_norm"),
+            "sequence_count": update_metrics.get("sequence_count"),
+            "mean_sequence_len": update_metrics.get("mean_sequence_len"),
             "total_episodes": self.total_episodes,
             "success_rate_total": self.arrive_count / self.total_episodes if self.total_episodes else 0.0,
             "collision_rate_total": self.collision_count / self.total_episodes if self.total_episodes else 0.0,
@@ -191,8 +211,12 @@ class TrainingLogger:
                 summary_row["buffer_size"],
                 summary_row["actor_loss"],
                 summary_row["critic_loss"],
+                summary_row["aux_loss"],
                 summary_row["total_loss"],
                 summary_row["entropy"],
+                summary_row["grad_norm"],
+                summary_row["sequence_count"],
+                summary_row["mean_sequence_len"],
                 summary_row["total_episodes"],
                 summary_row["success_rate_total"],
                 summary_row["collision_rate_total"],
@@ -206,8 +230,12 @@ class TrainingLogger:
         if self.writer:
             self.writer.add_scalar("loss/actor", update_metrics["actor_loss"], global_step)
             self.writer.add_scalar("loss/critic", update_metrics["critic_loss"], global_step)
+            self.writer.add_scalar("loss/aux", update_metrics["aux_loss"], global_step)
             self.writer.add_scalar("loss/total", update_metrics["total_loss"], global_step)
             self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
+            self.writer.add_scalar("train/grad_norm", update_metrics["grad_norm"], global_step)
+            self.writer.add_scalar("train/sequence_count", update_metrics["sequence_count"], global_step)
+            self.writer.add_scalar("train/mean_sequence_len", update_metrics["mean_sequence_len"], global_step)
 
         self._plot_update_metrics()
         self._plot_summary_metrics()
@@ -392,6 +420,7 @@ class TrainingLogger:
             [
                 ("Actor Loss", [row["actor_loss"] for row in self._update_rows]),
                 ("Critic Loss", [row["critic_loss"] for row in self._update_rows]),
+                ("Aux Loss", [row["aux_loss"] for row in self._update_rows]),
                 ("Total Loss", [row["total_loss"] for row in self._update_rows]),
             ],
             "PPO Loss Curves",
@@ -565,6 +594,7 @@ class TrainingLogger:
         steps = [row["update_step"] for row in self._update_rows]
         axes[0, 0].plot(steps, [row["actor_loss"] for row in self._update_rows], label="Actor")
         axes[0, 0].plot(steps, [row["critic_loss"] for row in self._update_rows], label="Critic")
+        axes[0, 0].plot(steps, [row["aux_loss"] for row in self._update_rows], label="Aux")
         axes[0, 0].plot(steps, [row["total_loss"] for row in self._update_rows], label="Total")
         axes[0, 0].set_title("PPO Loss")
         axes[0, 0].legend()

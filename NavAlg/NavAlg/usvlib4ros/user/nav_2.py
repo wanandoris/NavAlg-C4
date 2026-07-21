@@ -32,6 +32,10 @@ EPS_CLIP = 0.2         # PPO裁剪系数
 ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
 UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
 MIN_BUFFER_SIZE_FOR_UPDATE = 256
+AUX_LOSS_COEF = 0.1    # GRU辅助预测损失权重
+GRU_INPUT_DIM = 128     # 状态输入投影维度
+GRU_HIDDEN_DIM = 256    # Actor/Critic各自GRU隐藏维度
+AUX_HIDDEN_DIM = 128    # 辅助预测头隐藏维度
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
 TEACHER_EPSILON_DECAY = 0.001  # APF-PID作为专家的概率衰减系数
 TEACHER_EPSILON_MIN = 0.10    # 专家概率下限
@@ -140,8 +144,13 @@ class PPONav:
         # PPO智能体
         self.ppo_agent = PPO(
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
-            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT
+            GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT,
+            aux_loss_coef=AUX_LOSS_COEF,
+            gru_input_dim=GRU_INPUT_DIM,
+            gru_hidden_dim=GRU_HIDDEN_DIM,
+            aux_hidden_dim=AUX_HIDDEN_DIM,
         )
+        self.ppo_hidden = None
         if IS_LOAD:
             checkpoint_path = Path(NETWORK_PATH)
             if not checkpoint_path.is_file():
@@ -319,6 +328,7 @@ class PPONav:
         self.episode_reward_sum = 0.0
         self.current_episode_step = 0
         self.next_state = None
+        self.ppo_hidden = None
         self.last_distance = None
         self.done = False
         self.arrive = False
@@ -1067,7 +1077,7 @@ class PPONav:
         prev_distance = self.last_distance if self.last_distance is not None else current_distance
 
         state_tensor = torch.FloatTensor(state).to(device)
-        action = self.ppo_agent.select_action(state_tensor)
+        action, self.ppo_hidden = self.ppo_agent.select_action(state_tensor, self.ppo_hidden)
 
         # 执行动作
         result = self.step(
@@ -1079,6 +1089,7 @@ class PPONav:
         self.last_distance = result.distance   # 保存当前步距离供下一步使用
 
         # 记录经验
+        self.ppo_agent.buffer.next_states.append(result.next_state.tolist())
         self.ppo_agent.buffer.rewards.append(result.reward)
         self.ppo_agent.buffer.is_terminals.append(self.done)
         self.episode_reward_sum += result.reward
@@ -1096,8 +1107,10 @@ class PPONav:
         )
 
         if self.done:
+            self.ppo_hidden = None
             return True
         if self.arrive:
+            self.ppo_hidden = None
             LogUtil.info(f"Episode结束于step={step}, 总奖励={self.episode_reward_sum:.1f}")
             return True
         return False
