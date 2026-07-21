@@ -45,6 +45,15 @@ class EpisodeMetrics:
     entropy: float | None
     auc_return: float
     first_arrive_episode: int | None
+    teacher_epsilon: float
+    apf_steps: int
+    ppo_steps: int
+    apf_step_ratio: float
+    ppo_step_ratio: float
+    ppo_success_estimate_episode: float
+    ppo_success_rate_est_total: float
+    ppo_success_rate_est_sn: float
+    ppo_success_rate_est_sn_window: float | None
 
 
 class TrainingLogger:
@@ -73,6 +82,10 @@ class TrainingLogger:
         self.total_steps = 0
         self.return_auc = 0.0
         self.first_arrive_episode = None
+        self.total_apf_steps = 0
+        self.total_ppo_steps = 0
+        self.ppo_success_estimate_sum = 0.0
+        self.ppo_success_weight_sum = 0.0
         self._episode_rows: list[dict[str, Any]] = []
         self._summary_rows: list[dict[str, Any]] = []
         self._update_rows: list[dict[str, Any]] = []
@@ -99,6 +112,15 @@ class TrainingLogger:
                 "entropy",
                 "auc_return",
                 "first_arrive_episode",
+                "teacher_epsilon",
+                "apf_steps",
+                "ppo_steps",
+                "apf_step_ratio",
+                "ppo_step_ratio",
+                "ppo_success_estimate_episode",
+                "ppo_success_rate_est_total",
+                "ppo_success_rate_est_sn",
+                "ppo_success_rate_est_sn_window",
                 "success_rate_total",
                 "collision_rate_total",
                 "avg_episode_time_total",
@@ -125,6 +147,12 @@ class TrainingLogger:
                 "avg_steps_total",
                 "auc_return",
                 "first_arrive_episode",
+                "teacher_epsilon_latest",
+                "apf_step_ratio_total",
+                "ppo_step_ratio_total",
+                "ppo_success_rate_est_total",
+                "ppo_success_rate_est_sn",
+                "ppo_success_rate_est_sn_window",
             ],
         )
         self._write_csv_header(
@@ -202,6 +230,12 @@ class TrainingLogger:
             "avg_steps_total": self.total_steps / self.total_episodes if self.total_episodes else 0.0,
             "auc_return": self.return_auc,
             "first_arrive_episode": self.first_arrive_episode,
+            "teacher_epsilon_latest": self._episode_rows[-1]["teacher_epsilon"] if self._episode_rows else None,
+            "apf_step_ratio_total": self.total_apf_steps / self.total_steps if self.total_steps else 0.0,
+            "ppo_step_ratio_total": self.total_ppo_steps / self.total_steps if self.total_steps else 0.0,
+            "ppo_success_rate_est_total": self.ppo_success_estimate_sum / self.total_episodes if self.total_episodes else 0.0,
+            "ppo_success_rate_est_sn": self.ppo_success_estimate_sum / self.ppo_success_weight_sum if self.ppo_success_weight_sum else 0.0,
+            "ppo_success_rate_est_sn_window": self.get_ppo_success_rate_est_sn_window(),
         }
         self._summary_rows.append(summary_row)
         self._append_csv_row(
@@ -224,6 +258,12 @@ class TrainingLogger:
                 summary_row["avg_steps_total"],
                 summary_row["auc_return"],
                 summary_row["first_arrive_episode"],
+                summary_row["teacher_epsilon_latest"],
+                summary_row["apf_step_ratio_total"],
+                summary_row["ppo_step_ratio_total"],
+                summary_row["ppo_success_rate_est_total"],
+                summary_row["ppo_success_rate_est_sn"],
+                summary_row["ppo_success_rate_est_sn_window"],
             ],
         )
 
@@ -236,6 +276,12 @@ class TrainingLogger:
             self.writer.add_scalar("train/grad_norm", update_metrics["grad_norm"], global_step)
             self.writer.add_scalar("train/sequence_count", update_metrics["sequence_count"], global_step)
             self.writer.add_scalar("train/mean_sequence_len", update_metrics["mean_sequence_len"], global_step)
+            self.writer.add_scalar("metrics/apf_step_ratio_total", summary_row["apf_step_ratio_total"], global_step)
+            self.writer.add_scalar("metrics/ppo_step_ratio_total", summary_row["ppo_step_ratio_total"], global_step)
+            self.writer.add_scalar("metrics/ppo_success_rate_est_total", summary_row["ppo_success_rate_est_total"], global_step)
+            self.writer.add_scalar("metrics/ppo_success_rate_est_sn", summary_row["ppo_success_rate_est_sn"], global_step)
+            if summary_row["ppo_success_rate_est_sn_window"] is not None:
+                self.writer.add_scalar("metrics/ppo_success_rate_est_sn_window", summary_row["ppo_success_rate_est_sn_window"], global_step)
 
         self._plot_update_metrics()
         self._plot_summary_metrics()
@@ -251,6 +297,9 @@ class TrainingLogger:
         collided: bool,
         timeout: bool,
         last_update_metrics: dict[str, float] | None,
+        teacher_epsilon: float = 0.0,
+        apf_steps: int = 0,
+        ppo_steps: int = 0,
     ) -> EpisodeMetrics:
         self.total_episodes += 1
         self.arrive_count += int(arrived)
@@ -258,6 +307,21 @@ class TrainingLogger:
         self.total_episode_time += episode_time_sec
         self.total_steps += steps
         self.return_auc += episode_return
+        self.total_apf_steps += apf_steps
+        self.total_ppo_steps += ppo_steps
+
+        apf_step_ratio = apf_steps / steps if steps else 0.0
+        ppo_step_ratio = ppo_steps / steps if steps else 0.0
+        ppo_success_estimate_episode = float(int(arrived)) * ppo_step_ratio
+        self.ppo_success_estimate_sum += ppo_success_estimate_episode
+        self.ppo_success_weight_sum += ppo_step_ratio
+        ppo_success_rate_est_total = self.ppo_success_estimate_sum / self.total_episodes
+        ppo_success_rate_est_sn = (
+            self.ppo_success_estimate_sum / self.ppo_success_weight_sum
+            if self.ppo_success_weight_sum
+            else 0.0
+        )
+        ppo_success_rate_est_sn_window = self.get_ppo_success_rate_est_sn_window()
 
         if arrived and self.first_arrive_episode is None:
             self.first_arrive_episode = episode
@@ -276,6 +340,15 @@ class TrainingLogger:
             entropy=self._metric_value(last_update_metrics, "entropy"),
             auc_return=self.return_auc,
             first_arrive_episode=self.first_arrive_episode,
+            teacher_epsilon=teacher_epsilon,
+            apf_steps=apf_steps,
+            ppo_steps=ppo_steps,
+            apf_step_ratio=apf_step_ratio,
+            ppo_step_ratio=ppo_step_ratio,
+            ppo_success_estimate_episode=ppo_success_estimate_episode,
+            ppo_success_rate_est_total=ppo_success_rate_est_total,
+            ppo_success_rate_est_sn=ppo_success_rate_est_sn,
+            ppo_success_rate_est_sn_window=ppo_success_rate_est_sn_window,
         )
 
         total_success_rate = self.arrive_count / self.total_episodes
@@ -296,6 +369,15 @@ class TrainingLogger:
             "entropy": metrics.entropy,
             "auc_return": metrics.auc_return,
             "first_arrive_episode": metrics.first_arrive_episode,
+            "teacher_epsilon": metrics.teacher_epsilon,
+            "apf_steps": metrics.apf_steps,
+            "ppo_steps": metrics.ppo_steps,
+            "apf_step_ratio": metrics.apf_step_ratio,
+            "ppo_step_ratio": metrics.ppo_step_ratio,
+            "ppo_success_estimate_episode": metrics.ppo_success_estimate_episode,
+            "ppo_success_rate_est_total": metrics.ppo_success_rate_est_total,
+            "ppo_success_rate_est_sn": metrics.ppo_success_rate_est_sn,
+            "ppo_success_rate_est_sn_window": metrics.ppo_success_rate_est_sn_window,
             "success_rate_total": total_success_rate,
             "collision_rate_total": total_collision_rate,
             "avg_episode_time_total": total_avg_time,
@@ -319,6 +401,15 @@ class TrainingLogger:
                 row_dict["entropy"],
                 row_dict["auc_return"],
                 row_dict["first_arrive_episode"],
+                row_dict["teacher_epsilon"],
+                row_dict["apf_steps"],
+                row_dict["ppo_steps"],
+                row_dict["apf_step_ratio"],
+                row_dict["ppo_step_ratio"],
+                row_dict["ppo_success_estimate_episode"],
+                row_dict["ppo_success_rate_est_total"],
+                row_dict["ppo_success_rate_est_sn"],
+                row_dict["ppo_success_rate_est_sn_window"],
                 row_dict["success_rate_total"],
                 row_dict["collision_rate_total"],
                 row_dict["avg_episode_time_total"],
@@ -337,6 +428,14 @@ class TrainingLogger:
             self.writer.add_scalar("metrics/collision_rate_total", total_collision_rate, episode)
             self.writer.add_scalar("metrics/avg_episode_time_total", total_avg_time, episode)
             self.writer.add_scalar("metrics/avg_steps_total", total_avg_steps, episode)
+            self.writer.add_scalar("teacher/epsilon", teacher_epsilon, episode)
+            self.writer.add_scalar("teacher/apf_step_ratio", apf_step_ratio, episode)
+            self.writer.add_scalar("teacher/ppo_step_ratio", ppo_step_ratio, episode)
+            self.writer.add_scalar("metrics/ppo_success_estimate_episode", ppo_success_estimate_episode, episode)
+            self.writer.add_scalar("metrics/ppo_success_rate_est_total", ppo_success_rate_est_total, episode)
+            self.writer.add_scalar("metrics/ppo_success_rate_est_sn", ppo_success_rate_est_sn, episode)
+            if ppo_success_rate_est_sn_window is not None:
+                self.writer.add_scalar("metrics/ppo_success_rate_est_sn_window", ppo_success_rate_est_sn_window, episode)
 
         self._plot_episode_metrics()
         return metrics
@@ -353,6 +452,24 @@ class TrainingLogger:
         if not metrics:
             return None
         return metrics.get(key)
+
+    def get_ppo_success_rate_est_sn_window(
+        self,
+        window_size: int = 50,
+        min_weight: float = 5.0,
+    ) -> float | None:
+        rows = self._episode_rows[-window_size:]
+        if not rows:
+            return None
+
+        weighted_success_sum = sum(
+            int(row["arrived"]) * float(row["ppo_step_ratio"])
+            for row in rows
+        )
+        ppo_weight_sum = sum(float(row["ppo_step_ratio"]) for row in rows)
+        if ppo_weight_sum < min_weight:
+            return None
+        return weighted_success_sum / ppo_weight_sum
 
     def _plot_all(self):
         self._plot_episode_metrics()
@@ -394,6 +511,9 @@ class TrainingLogger:
             episodes,
             [
                 ("Success Rate Total", [row["success_rate_total"] for row in self._episode_rows]),
+                ("PPO Success Est Total", [row["ppo_success_rate_est_total"] for row in self._episode_rows]),
+                ("PPO Success Est SN", [row["ppo_success_rate_est_sn"] for row in self._episode_rows]),
+                ("PPO Success Est SN Window", [row["ppo_success_rate_est_sn_window"] for row in self._episode_rows]),
                 ("Collision Rate Total", [row["collision_rate_total"] for row in self._episode_rows]),
             ],
             "Success / Collision Rate",
@@ -407,6 +527,18 @@ class TrainingLogger:
             "AUC Return",
             "Episode",
             "AUC",
+        )
+        self._save_multi_line_plot(
+            self.plot_dir / "teacher_policy_ratio.png",
+            episodes,
+            [
+                ("APF Step Ratio", [row["apf_step_ratio"] for row in self._episode_rows]),
+                ("PPO Step Ratio", [row["ppo_step_ratio"] for row in self._episode_rows]),
+                ("Teacher Epsilon", [row["teacher_epsilon"] for row in self._episode_rows]),
+            ],
+            "Teacher / PPO Step Ratio",
+            "Episode",
+            "Ratio",
         )
 
     def _plot_update_metrics(self):
@@ -454,6 +586,9 @@ class TrainingLogger:
             updates,
             [
                 ("Success Rate Total", [row["success_rate_total"] for row in self._summary_rows]),
+                ("PPO Success Est Total", [row["ppo_success_rate_est_total"] for row in self._summary_rows]),
+                ("PPO Success Est SN", [row["ppo_success_rate_est_sn"] for row in self._summary_rows]),
+                ("PPO Success Est SN Window", [row["ppo_success_rate_est_sn_window"] for row in self._summary_rows]),
                 ("Collision Rate Total", [row["collision_rate_total"] for row in self._summary_rows]),
             ],
             "Summary Metrics",
@@ -576,6 +711,7 @@ class TrainingLogger:
         axes[1, 0].plot(episodes, [row["episode_time_sec"] for row in self._episode_rows], color="tab:green")
         axes[1, 0].set_title("Episode Time")
         axes[1, 1].plot(episodes, [row["success_rate_total"] for row in self._episode_rows], label="Success", color="tab:green")
+        axes[1, 1].plot(episodes, [row["ppo_success_rate_est_total"] for row in self._episode_rows], label="PPO Est", color="tab:blue")
         axes[1, 1].plot(episodes, [row["collision_rate_total"] for row in self._episode_rows], label="Collision", color="tab:red")
         axes[1, 1].set_title("Success / Collision")
         axes[1, 1].legend()
@@ -617,6 +753,9 @@ class TrainingLogger:
 
         updates = [row["update_step"] for row in self._summary_rows]
         axes[0].plot(updates, [row["success_rate_total"] for row in self._summary_rows], label="Success")
+        axes[0].plot(updates, [row["ppo_success_rate_est_total"] for row in self._summary_rows], label="PPO Est")
+        axes[0].plot(updates, [row["ppo_success_rate_est_sn"] for row in self._summary_rows], label="PPO Est SN")
+        axes[0].plot(updates, [row["ppo_success_rate_est_sn_window"] for row in self._summary_rows], label="PPO Est Win")
         axes[0].plot(updates, [row["collision_rate_total"] for row in self._summary_rows], label="Collision")
         axes[0].set_title("Summary Rates")
         axes[0].legend()

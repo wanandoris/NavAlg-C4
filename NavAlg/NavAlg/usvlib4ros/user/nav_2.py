@@ -39,6 +39,13 @@ AUX_HIDDEN_DIM = 128    # 辅助预测头隐藏维度
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
 TEACHER_EPSILON_DECAY = 0.001  # APF-PID作为专家的概率衰减系数
 TEACHER_EPSILON_MIN = 0.10    # 专家概率下限
+TEACHER_EPSILON_MAX = 1.00
+TEACHER_PERF_WINDOW_SIZE = 50
+TEACHER_PERF_MIN_WEIGHT = 5.0
+TEACHER_PERF_THRESHOLD_HIGH = 0.75
+TEACHER_PERF_THRESHOLD_LOW = 0.45
+TEACHER_PERF_DECAY_FACTOR = 0.95
+TEACHER_PERF_INCREASE_FACTOR = 1.05
 
 # ==================== 奖励相关 ====================
 REWARD_ARRIVE_BONUS = 80
@@ -204,6 +211,8 @@ class PPONav:
         self.rotate_control_mode = ROTATE_CONTROL_MODE.upper()
         self.teacher_prob = 1.0
         self.teacher_last_selected = False
+        self.episode_apf_steps = 0
+        self.episode_ppo_steps = 0
         self.heading_pid = PID(
             PIDConfig(
                 kp=HEADING_PID_KP,
@@ -241,7 +250,7 @@ class PPONav:
                     try:
                         LogUtil.info(f"第 {epoch} 轮训练开始")
                         last_update_metrics = None
-                        self.teacher_prob = self._calc_teacher_probability(epoch)
+                        self.teacher_prob = self._update_teacher_probability(epoch)
 
                         # 加载航线
                         self.route = self.ros_ctrl.getRoute()
@@ -314,6 +323,9 @@ class PPONav:
                             collided=self.done and not self.arrive,
                             timeout=self.timeout and not self.done and not self.arrive,
                             last_update_metrics=last_update_metrics,
+                            teacher_epsilon=self.teacher_prob,
+                            apf_steps=self.episode_apf_steps,
+                            ppo_steps=self.episode_ppo_steps,
                         )
                     except Exception as e:
                         LogUtil.error(f"第 {epoch} 轮训练异常: {e}")
@@ -337,6 +349,8 @@ class PPONav:
         self.destPoint = None
         self.max_distance = 0.0
         self.episode_step_count = 0
+        self.episode_apf_steps = 0
+        self.episode_ppo_steps = 0
         self.last_heading_debug = {
             "ppo_target_heading": 0.0,
             "pid_target_heading": 0.0,
@@ -483,9 +497,27 @@ class PPONav:
         return max(-1.0, min(1.0, float(value)))
 
     @staticmethod
-    def _calc_teacher_probability(episode: int) -> float:
+    def _calc_teacher_probability_base(episode: int) -> float:
         epsilon = math.exp(-TEACHER_EPSILON_DECAY * max(0, episode))
-        return max(TEACHER_EPSILON_MIN, min(1.0, epsilon))
+        return max(TEACHER_EPSILON_MIN, min(TEACHER_EPSILON_MAX, epsilon))
+
+    def _update_teacher_probability(self, episode: int) -> float:
+        epsilon_base = self._calc_teacher_probability_base(episode)
+        success_rate_est = self.training_logger.get_ppo_success_rate_est_sn_window(
+            window_size=TEACHER_PERF_WINDOW_SIZE,
+            min_weight=TEACHER_PERF_MIN_WEIGHT,
+        )
+
+        if success_rate_est is None:
+            return epsilon_base
+
+        epsilon = min(self.teacher_prob, epsilon_base)
+        if success_rate_est > TEACHER_PERF_THRESHOLD_HIGH:
+            epsilon *= TEACHER_PERF_DECAY_FACTOR
+        elif success_rate_est < TEACHER_PERF_THRESHOLD_LOW:
+            epsilon *= TEACHER_PERF_INCREASE_FACTOR
+
+        return max(TEACHER_EPSILON_MIN, min(epsilon_base, epsilon))
 
     def _should_update_ppo(self) -> bool:
         return len(self.ppo_agent.buffer.rewards) >= MIN_BUFFER_SIZE_FOR_UPDATE
@@ -722,6 +754,10 @@ class PPONav:
             elif self.rotate_control_mode == "PID":
                 use_teacher = True
             self.teacher_last_selected = use_teacher
+            if use_teacher:
+                self.episode_apf_steps += 1
+            else:
+                self.episode_ppo_steps += 1
             selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
             heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
             adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
@@ -773,6 +809,10 @@ class PPONav:
             )
             use_teacher = self.rotate_control_mode == "PID"
             self.teacher_last_selected = use_teacher
+            if use_teacher:
+                self.episode_apf_steps += 1
+            else:
+                self.episode_ppo_steps += 1
             selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
             heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
             adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
