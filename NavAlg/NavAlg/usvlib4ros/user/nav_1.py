@@ -381,10 +381,10 @@ class PPONav:
                              current_distance: float, max_distance: float) -> float:
         """计算航向对齐奖励。"""
         yaw_rewards = []
-        pi = math.pi
+        heading_deg = math.degrees(heading)
         for i in range(N_ACTIONS):
-            angle = -pi / 4 + heading + (pi / 8 * i) + pi / 2
-            tr = 1 - 4 * abs(0.5 - math.modf(0.25 + 0.5 * angle % (2 * pi) / pi)[0])
+            angle_deg = (heading_deg + 45.0 + 22.5 * i) % 360.0
+            tr = 1 - 4 * abs(0.5 - ((0.25 + 0.5 * (angle_deg / 180.0)) % 1.0))
             yaw_rewards.append(tr)
 
         distance_rate = 2 ** (current_distance / max_distance) if max_distance > 0 else 1.0

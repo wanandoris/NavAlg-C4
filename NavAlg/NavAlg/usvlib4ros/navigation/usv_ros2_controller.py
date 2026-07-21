@@ -148,7 +148,7 @@ class Ros2Controller:
         if type(defaultValue).__name__ != 'list' and type(defaultValue).__name__ != 'tuple':
             defaultValue = [defaultValue]
 
-        typeOk = cls.typeCheck(value=defaultValue, registerType=valueType)
+        typeOk = self.typeCheck(value=defaultValue, registerType=valueType)
         if typeOk is False:
             raise Exception("Defaultvalue %s is not instance of %s ." % (defaultValue, valueType))
 
@@ -236,7 +236,14 @@ class Ros2Controller:
         }
         response = self.deviceManageSrvCall.callService(request)
         LogUtil.info(response)
-        return response['result'] == 1
+        ok = response['result'] == 1
+        if not ok:
+            LogUtil.info(
+                f"create_ship failed for deviceId={self.deviceId}. "
+                "The service accepted the request, but returned result=0. "
+                "Check whether the intelligent-agent is already registered or the simulator is not ready."
+            )
+        return ok
 
     def reset_unity(self):
         """data : 1 导航请求复位unity环境，2 ：unity回复环境复位已完成"""

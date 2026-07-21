@@ -16,3 +16,4 @@
 *runs/
 .venv
 .idea
+.vscode

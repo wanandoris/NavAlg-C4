@@ -1086,18 +1086,14 @@ class PPONav:
         # 输出控制量（修复点：补全参数）
         self._output_control_commands(result, episode, step, nav_context['nextPointIndex'])
 
-        if self.rotate_control_mode == "PID":
-            LogUtil.debug(
-                f"Step={step} Action={action} Reward={result.reward:.2f} "
-                f"Rudder={result.advise_rotate:.1f} "
-                f"Done={self.done} Arrive={self.arrive}"
-            )
-        else:
-            LogUtil.debug(
-                f"Step={step} Action={action} Reward={result.reward:.2f} "
-                f"Rudder={result.advise_rotate:.1f} "
-                f"Done={self.done} Arrive={self.arrive}"
-            )
+        pose = self.global_data.scada_data.pose
+        LogUtil.debug(
+            f"Step={step} Action={action} Reward={result.reward:.2f} "
+            f"Throttle={result.advise_speed:.1f} Rudder={result.advise_rotate:.1f} "
+            f"HeadingCmd={result.advised_heading:.1f} Distance={result.current_distance:.1f} "
+            f"PoseSpeed={pose.speed:.3f} PoseRotateSpeed={pose.rotate_speed:.3f} "
+            f"Done={self.done} Arrive={self.arrive}"
+        )
 
         if self.done:
             return True

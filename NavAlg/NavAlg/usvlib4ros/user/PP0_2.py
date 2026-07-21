@@ -38,7 +38,7 @@ class RolloutBuffer:
 
 
 class ActorCritic(nn.Module):
-    """改进版 Actor-Critic：共享特征 + LayerNorm + SiLU + 正交初始化。"""
+    """Actor-Critic 网络：actor 和 critic 彻底分离。"""
 
     def __init__(self, state_dim: int, action_dim: int,
                  has_continuous_action_space: bool, action_std_init: float):
@@ -46,21 +46,27 @@ class ActorCritic(nn.Module):
         self.has_continuous_action_space = has_continuous_action_space
         hidden_dim = 256
 
-        # ===== 共享特征提取器 =====
-        self.shared = nn.Sequential(
+        # ===== Actor 分支 =====
+        self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
         )
 
-        # ===== Actor 输出头 =====
-        self.actor_mean = nn.Linear(hidden_dim, action_dim)
-
-        # ===== Critic 输出头 =====
-        self.critic = nn.Linear(hidden_dim, 1)
+        # ===== Critic 分支 =====
+        self.critic = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
         # ===== 连续动作对数标准差 =====
         if has_continuous_action_space:
@@ -72,22 +78,28 @@ class ActorCritic(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # 共享层 gain=np.sqrt(2)
-        for module in self.shared.modules():
+        # Actor/critic 隐藏层 gain=np.sqrt(2)
+        for module in self.actor.modules():
             if isinstance(module, nn.Linear):
                 torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
                 if module.bias is not None:
                     torch.nn.init.constant_(module.bias, 0.0)
 
-        # Actor 末层 gain=0.01
-        torch.nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
-        if self.actor_mean.bias is not None:
-            torch.nn.init.constant_(self.actor_mean.bias, 0.0)
+        for module in self.critic.modules():
+            if isinstance(module, nn.Linear):
+                torch.nn.init.orthogonal_(module.weight, gain=np.sqrt(2))
+                if module.bias is not None:
+                    torch.nn.init.constant_(module.bias, 0.0)
 
-        # Critic 末层 gain=1.0
-        torch.nn.init.orthogonal_(self.critic.weight, gain=1.0)
-        if self.critic.bias is not None:
-            torch.nn.init.constant_(self.critic.bias, 0.0)
+        # Actor 末层 gain=0.01，Critic 末层 gain=1.0
+        actor_last = self.actor[-1]
+        critic_last = self.critic[-1]
+        torch.nn.init.orthogonal_(actor_last.weight, gain=0.01)
+        if actor_last.bias is not None:
+            torch.nn.init.constant_(actor_last.bias, 0.0)
+        torch.nn.init.orthogonal_(critic_last.weight, gain=1.0)
+        if critic_last.bias is not None:
+            torch.nn.init.constant_(critic_last.bias, 0.0)
 
     def _get_log_std(self, learnable: bool) -> torch.Tensor:
         log_std = torch.clamp(self.log_std, min=-3.0, max=-0.3)
@@ -105,17 +117,16 @@ class ActorCritic(nn.Module):
 
     def act(self, state: torch.Tensor):
         state = self._sanitize_tensor(state.to(device))
-        shared_out = self.shared(state)
 
         if self.has_continuous_action_space:
-            raw = self.actor_mean(shared_out)
+            raw = self.actor(state)
             action_mean = self._get_action_mean(raw)
             log_std = self._get_log_std(learnable=True)
             std = torch.exp(log_std)
             scale_tril = torch.diag(std)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
         else:
-            logits = self.actor_mean(shared_out)
+            logits = self.actor(state)
             dist = Categorical(logits=logits)
 
         action = dist.sample()
@@ -123,10 +134,9 @@ class ActorCritic(nn.Module):
 
     def evaluate(self, state: torch.Tensor, action: torch.Tensor, learnable_std: bool = True):
         state = self._sanitize_tensor(state.to(device))
-        shared_out = self.shared(state)
 
         if self.has_continuous_action_space:
-            raw = self.actor_mean(shared_out)
+            raw = self.actor(state)
             action_mean = self._get_action_mean(raw)
             action_mean = self._sanitize_tensor(action_mean)
             log_std = self._get_log_std(learnable=learnable_std)
@@ -135,17 +145,16 @@ class ActorCritic(nn.Module):
             scale_tril = torch.diag_embed(std_batch)
             dist = MultivariateNormal(action_mean, scale_tril=scale_tril)
         else:
-            logits = self.actor_mean(shared_out)
+            logits = self.actor(state)
             dist = Categorical(logits=logits)
 
-        state_value = self.critic(shared_out)
+        state_value = self.critic(state)
         return dist.log_prob(action), state_value, dist.entropy()
 
     def get_value(self, state: torch.Tensor) -> torch.Tensor:
-        """外部调用获得状态价值，内部自动经过共享层。"""
+        """外部调用获得状态价值。"""
         state = self._sanitize_tensor(state.to(device))
-        shared_out = self.shared(state)
-        return self.critic(shared_out)
+        return self.critic(state)
 
 
 class PPO:
@@ -186,12 +195,13 @@ class PPO:
         # 当前策略网络(用于训练)
         self.policy = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
         # 优化器:Actor 和 Critic 使用各自的学习率(通过参数分组实现)
-        self.optimizer = torch.optim.Adam([
-            {'params': self.policy.shared.parameters(), 'lr': lr_actor},
-            {'params': self.policy.actor_mean.parameters(), 'lr': lr_actor},
-            {'params': [self.policy.log_std], 'lr': lr_actor},
+        optimizer_groups = [
+            {'params': self.policy.actor.parameters(), 'lr': lr_actor},
             {'params': self.policy.critic.parameters(), 'lr': lr_critic},
-        ])
+        ]
+        if has_continuous_action_space:
+            optimizer_groups.append({'params': [self.policy.log_std], 'lr': lr_actor})
+        self.optimizer = torch.optim.Adam(optimizer_groups)
 
         # 旧策略网络(用于采样,更新时与当前策略比较)
         self.policy_old = ActorCritic(state_dim, action_dim, has_continuous_action_space, action_std_init).to(device)
