@@ -135,6 +135,7 @@ class TrainingLogger:
                 "actor_loss",
                 "critic_loss",
                 "aux_loss",
+                "smooth_loss",
                 "total_loss",
                 "entropy",
                 "grad_norm",
@@ -163,6 +164,7 @@ class TrainingLogger:
                 "actor_loss",
                 "critic_loss",
                 "aux_loss",
+                "smooth_loss",
                 "total_loss",
                 "entropy",
                 "grad_norm",
@@ -191,6 +193,7 @@ class TrainingLogger:
             "actor_loss": update_metrics.get("actor_loss"),
             "critic_loss": update_metrics.get("critic_loss"),
             "aux_loss": update_metrics.get("aux_loss"),
+            "smooth_loss": update_metrics.get("smooth_loss"),
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
             "grad_norm": update_metrics.get("grad_norm"),
@@ -203,6 +206,7 @@ class TrainingLogger:
             row_dict["actor_loss"],
             row_dict["critic_loss"],
             row_dict["aux_loss"],
+            row_dict["smooth_loss"],
             row_dict["total_loss"],
             row_dict["entropy"],
             row_dict["grad_norm"],
@@ -218,6 +222,7 @@ class TrainingLogger:
             "actor_loss": update_metrics.get("actor_loss"),
             "critic_loss": update_metrics.get("critic_loss"),
             "aux_loss": update_metrics.get("aux_loss"),
+            "smooth_loss": update_metrics.get("smooth_loss"),
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
             "grad_norm": update_metrics.get("grad_norm"),
@@ -246,6 +251,7 @@ class TrainingLogger:
                 summary_row["actor_loss"],
                 summary_row["critic_loss"],
                 summary_row["aux_loss"],
+                summary_row["smooth_loss"],
                 summary_row["total_loss"],
                 summary_row["entropy"],
                 summary_row["grad_norm"],
@@ -271,6 +277,7 @@ class TrainingLogger:
             self.writer.add_scalar("loss/actor", update_metrics["actor_loss"], global_step)
             self.writer.add_scalar("loss/critic", update_metrics["critic_loss"], global_step)
             self.writer.add_scalar("loss/aux", update_metrics["aux_loss"], global_step)
+            self.writer.add_scalar("loss/smooth", update_metrics["smooth_loss"], global_step)
             self.writer.add_scalar("loss/total", update_metrics["total_loss"], global_step)
             self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
             self.writer.add_scalar("train/grad_norm", update_metrics["grad_norm"], global_step)
@@ -553,6 +560,7 @@ class TrainingLogger:
                 ("Actor Loss", [row["actor_loss"] for row in self._update_rows]),
                 ("Critic Loss", [row["critic_loss"] for row in self._update_rows]),
                 ("Aux Loss", [row["aux_loss"] for row in self._update_rows]),
+                ("Smooth Loss", [row["smooth_loss"] for row in self._update_rows]),
                 ("Total Loss", [row["total_loss"] for row in self._update_rows]),
             ],
             "PPO Loss Curves",
@@ -731,6 +739,7 @@ class TrainingLogger:
         axes[0, 0].plot(steps, [row["actor_loss"] for row in self._update_rows], label="Actor")
         axes[0, 0].plot(steps, [row["critic_loss"] for row in self._update_rows], label="Critic")
         axes[0, 0].plot(steps, [row["aux_loss"] for row in self._update_rows], label="Aux")
+        axes[0, 0].plot(steps, [row["smooth_loss"] for row in self._update_rows], label="Smooth")
         axes[0, 0].plot(steps, [row["total_loss"] for row in self._update_rows], label="Total")
         axes[0, 0].set_title("PPO Loss")
         axes[0, 0].legend()

@@ -18,3 +18,5 @@
 .idea
 .vscode
 *docs/TODO.md
+*docs/plotneuralnet
+*docs/flowchart

@@ -33,12 +33,13 @@ ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
 UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
 MIN_BUFFER_SIZE_FOR_UPDATE = 256
 AUX_LOSS_COEF = 0.1    # GRU辅助预测损失权重
+SMOOTH_LOSS_COEF = 0.005  # 一阶航迹平滑损失权重,约束连续动作中的转向变化
 GRU_INPUT_DIM = 128     # 状态输入投影维度
 GRU_HIDDEN_DIM = 256    # Actor/Critic各自GRU隐藏维度
 AUX_HIDDEN_DIM = 128    # 辅助预测头隐藏维度
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
-TEACHER_EPSILON_DECAY = 0.001  # APF-PID作为专家的概率衰减系数
-TEACHER_EPSILON_MIN = 0.10    # 专家概率下限
+TEACHER_EPSILON_DECAY = 0.0009  # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.01    # 专家概率下限
 TEACHER_EPSILON_MAX = 1.00
 TEACHER_PERF_WINDOW_SIZE = 50
 TEACHER_PERF_MIN_WEIGHT = 5.0
@@ -67,7 +68,7 @@ REWARD_APF_OBSTACLE_INFLUENCE_RANGE = 2.5
 REWARD_TIME_EXPONENT = 1.5
 
 # ==================== 导航/PID 相关 ====================
-LASER_MAX_RANGE = 8.0        # 激光雷达有效最大距离(m)
+LASER_MAX_RANGE = 10.0        # 激光雷达有效最大距离(m)
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
@@ -76,7 +77,7 @@ TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
 ACTION_TO_SPEED_CONTINOUS_SCALE = 120 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.01            # 控制周期(s),用于连续动作 （同样与时间刻相关）
-PPO_TARGET_HEADING_MAX_OFFSET = 90.0  # PPO目标航向最大偏转角(度)
+PPO_TARGET_HEADING_MAX_OFFSET = 180.0  # PPO目标航向最大偏转角(度)
 ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
 HEADING_PID_KP = 1.2
 HEADING_PID_KI = 0.02
@@ -84,18 +85,18 @@ HEADING_PID_KD = 0.15
 HEADING_PID_INTEGRAL_LIMIT = 60.0
 
 # ==================== 其它  ====================
-MAX_EPOCH = 4000       # 最大训练轮数
+MAX_EPOCH = 100000       # 最大训练轮数
 MAX_STEP_PER_EPISODE = 500   # 每轮最大步数
 MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)（同样与时间刻相关）
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 IS_LOAD = False
 NETWORK_PATH = r"D:\C4\Results\ppo_nav_latest\checkpoints\PPO_ship_obstacle_latest.pth"
 MAX_RESET_RETRIES = 5
-ENABLE_APF_DEBUG_VIEW = False         # 是否打开APF方向实时调试窗口
+ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
 
 # ==================== 时间刻 ====================
-TIME_RATE = 2
+TIME_RATE = 1
 TASK_WAIT_SLEEP = 0.1 / TIME_RATE         # 等待训练触发轮询间隔(秒)
 EMPTY_ROUTE_SLEEP = 0.1 / TIME_RATE       # 航线为空时的等待间隔(秒)
 STEP_SLEEP = 0.1 / TIME_RATE              # 每步主循环结束等待间隔(秒)
@@ -153,6 +154,7 @@ class PPONav:
             N_STATES, N_ACTIONS, LR_ACTOR, LR_CRITIC,
             GAMMA, K_EPOCHS, EPS_CLIP, HAS_CONTINUOUS_ACTION, ACTION_STD_INIT,
             aux_loss_coef=AUX_LOSS_COEF,
+            smooth_loss_coef=SMOOTH_LOSS_COEF,
             gru_input_dim=GRU_INPUT_DIM,
             gru_hidden_dim=GRU_HIDDEN_DIM,
             aux_hidden_dim=AUX_HIDDEN_DIM,

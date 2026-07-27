@@ -222,7 +222,7 @@ class ActorCritic(nn.Module):
         )
 
     def evaluate(self, state: torch.Tensor, action: torch.Tensor, learnable_std: bool = True):
-        logprobs, state_value, dist_entropy, _ = self.evaluate_sequence(
+        logprobs, state_value, dist_entropy, _, _ = self.evaluate_sequence(
             state,
             action,
             learnable_std=learnable_std,
@@ -246,6 +246,7 @@ class ActorCritic(nn.Module):
         critic_flat = critic_out.reshape(batch_size * seq_len, -1)
 
         raw = self.actor_head(actor_flat)
+        action_mean = self._get_action_mean(raw)
         values = self.critic_head(critic_flat)
         aux_features = torch.cat([actor_flat, critic_flat], dim=-1)
         pred_next_states = self.aux_predictor(aux_features) if predict_next_state else None
@@ -259,7 +260,7 @@ class ActorCritic(nn.Module):
 
         logprobs = dist.log_prob(flat_action)
         entropy = dist.entropy()
-        return logprobs, values, entropy, pred_next_states
+        return logprobs, values, entropy, pred_next_states, action_mean
 
     def get_value(self, state: torch.Tensor) -> torch.Tensor:
         """外部调用获得状态价值。"""
@@ -280,6 +281,7 @@ class PPO:
                  gamma: float, K_epochs: int, eps_clip: float,
                  has_continuous_action_space: bool, action_std_init: float,
                  writer=None, gae_lambda: float = 0.95, aux_loss_coef: float = 0.01,
+                 smooth_loss_coef: float = 0.0,
                  gru_input_dim: int = 128, gru_hidden_dim: int = 256,
                  aux_hidden_dim: int = 128):
         """初始化 PPO 算法的超参数、网络和优化器。
@@ -304,6 +306,7 @@ class PPO:
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.aux_loss_coef = aux_loss_coef
+        self.smooth_loss_coef = smooth_loss_coef
         self.buffer = RolloutBuffer()           # 经验缓冲区
 
         # 当前策略网络(用于训练)
@@ -380,6 +383,13 @@ class PPO:
     def _state_prediction_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return torch.mean((pred - target) ** 2)
 
+    @staticmethod
+    def _turn_smoothness_loss(action_mean: torch.Tensor) -> torch.Tensor:
+        if action_mean.size(0) < 2:
+            return torch.tensor(0.0, dtype=action_mean.dtype, device=action_mean.device)
+        turn_mean = action_mean[:, 0]
+        return torch.mean((turn_mean[1:] - turn_mean[:-1]) ** 2)
+
     def update(self):
         """使用缓冲区中收集的经验更新策略网络(PPO 核心更新步骤)。"""
         if not self.buffer.rewards:
@@ -433,6 +443,7 @@ class PPO:
         actor_loss_value = 0.0
         critic_loss_value = 0.0
         aux_loss_value = 0.0
+        smooth_loss_value = 0.0
         total_loss_value = 0.0
         entropy_value = 0.0
         grad_norm_value = 0.0
@@ -441,12 +452,13 @@ class PPO:
             value_parts = []
             entropy_parts = []
             aux_loss_parts = []
+            smooth_loss_parts = []
 
             for start, end in segments:
                 seg_states = old_states[start:end]
                 seg_actions = old_actions[start:end]
                 seg_next_states = old_next_states[start:end]
-                logprobs, state_values, dist_entropy, pred_next_states = self.policy.evaluate_sequence(
+                logprobs, state_values, dist_entropy, pred_next_states, action_mean = self.policy.evaluate_sequence(
                     seg_states,
                     seg_actions,
                     predict_next_state=True,
@@ -455,6 +467,8 @@ class PPO:
                 value_parts.append(state_values.squeeze(-1))
                 entropy_parts.append(dist_entropy)
                 aux_loss_parts.append(self._state_prediction_mse(pred_next_states, seg_next_states))
+                if self.has_continuous_action_space:
+                    smooth_loss_parts.append(self._turn_smoothness_loss(action_mean))
 
             logprobs = torch.cat(logprob_parts, dim=0)
             state_values = torch.cat(value_parts, dim=0)
@@ -477,8 +491,14 @@ class PPO:
             critic_loss = self.mse_loss(state_values, seg_returns)
             entropy_bonus = dist_entropy
             aux_loss = torch.stack(aux_loss_parts).mean()
+            smooth_loss = (
+                torch.stack(smooth_loss_parts).mean()
+                if smooth_loss_parts
+                else torch.tensor(0.0, dtype=torch.float32, device=device)
+            )
             loss = actor_loss.mean() + 0.5 * critic_loss - 0.01 * entropy_bonus.mean()
             loss = loss + self.aux_loss_coef * aux_loss
+            loss = loss + self.smooth_loss_coef * smooth_loss
 
             if not torch.isfinite(loss):
                 logger.warning("PPO update skipped because loss contains NaN/Inf")
@@ -488,6 +508,7 @@ class PPO:
             actor_loss_value = actor_loss.mean().item()
             critic_loss_value = critic_loss.item()
             aux_loss_value = aux_loss.item()
+            smooth_loss_value = smooth_loss.item()
             total_loss_value = loss.item()
             entropy_value = entropy_bonus.mean().item()
 
@@ -509,6 +530,7 @@ class PPO:
             "actor_loss": actor_loss_value,
             "critic_loss": critic_loss_value,
             "aux_loss": aux_loss_value,
+            "smooth_loss": smooth_loss_value,
             "total_loss": total_loss_value,
             "entropy": entropy_value,
             "buffer_size": len(rewards),
