@@ -390,6 +390,17 @@ class PPO:
         turn_mean = action_mean[:, 0]
         return torch.mean((turn_mean[1:] - turn_mean[:-1]) ** 2)
 
+    @staticmethod
+    def _grad_norm(parameters) -> float:
+        grad_norms = [
+            param.grad.detach().norm(2)
+            for param in parameters
+            if param.grad is not None
+        ]
+        if not grad_norms:
+            return 0.0
+        return float(torch.stack(grad_norms).norm(2).item())
+
     def update(self):
         """使用缓冲区中收集的经验更新策略网络(PPO 核心更新步骤)。"""
         if not self.buffer.rewards:
@@ -447,6 +458,7 @@ class PPO:
         total_loss_value = 0.0
         entropy_value = 0.0
         grad_norm_value = 0.0
+        critic_grad_norm_value = 0.0
         for _ in range(self.K_epochs):
             logprob_parts = []
             value_parts = []
@@ -515,6 +527,7 @@ class PPO:
             # 反向传播与参数更新
             self.optimizer.zero_grad()
             loss.backward()
+            critic_grad_norm_value = self._grad_norm(self.policy.critic_parameters())
             # 梯度裁剪防止梯度爆炸
             grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
             grad_norm_value = float(grad_norm.item())
@@ -535,6 +548,7 @@ class PPO:
             "entropy": entropy_value,
             "buffer_size": len(rewards),
             "grad_norm": grad_norm_value,
+            "critic_grad_norm": critic_grad_norm_value,
             "sequence_count": len(segments),
             "mean_sequence_len": sum(end - start for start, end in segments) / len(segments),
         }

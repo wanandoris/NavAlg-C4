@@ -59,9 +59,36 @@ class EpisodeMetrics:
 class TrainingLogger:
     """轻量训练日志器，同时记录 TensorBoard 和 CSV。"""
 
-    def __init__(self, root_dir: str | Path = "Results"):
+    EPISODE_FIELDS = [
+        "episode", "episode_return", "steps", "episode_time_sec", "arrived", "collided", "timeout",
+        "actor_loss", "critic_loss", "total_loss", "entropy", "auc_return", "first_arrive_episode",
+        "teacher_epsilon", "apf_steps", "ppo_steps", "apf_step_ratio", "ppo_step_ratio",
+        "ppo_success_estimate_episode", "ppo_success_rate_est_total", "ppo_success_rate_est_sn",
+        "ppo_success_rate_est_sn_window", "success_rate_total", "collision_rate_total",
+        "avg_episode_time_total", "avg_steps_total",
+    ]
+    SUMMARY_FIELDS = [
+        "update_step", "buffer_size", "actor_loss", "critic_loss", "aux_loss", "smooth_loss",
+        "total_loss", "entropy", "grad_norm", "critic_grad_norm", "sequence_count", "mean_sequence_len", "total_episodes",
+        "success_rate_total", "collision_rate_total", "avg_episode_time_total", "avg_steps_total",
+        "auc_return", "first_arrive_episode", "teacher_epsilon_latest", "apf_step_ratio_total",
+        "ppo_step_ratio_total", "ppo_success_rate_est_total", "ppo_success_rate_est_sn",
+        "ppo_success_rate_est_sn_window",
+    ]
+    UPDATE_FIELDS = [
+        "update_step", "buffer_size", "actor_loss", "critic_loss", "aux_loss", "smooth_loss",
+        "total_loss", "entropy", "grad_norm", "critic_grad_norm", "sequence_count", "mean_sequence_len",
+    ]
+
+    def __init__(
+        self,
+        root_dir: str | Path = "Results",
+        run_dir: str | Path | None = None,
+        resume_episode: int | None = None,
+        resume_update_step: int | None = None,
+    ):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.run_dir = Path(root_dir) / f"ppo_nav_{timestamp}"
+        self.run_dir = Path(run_dir) if run_dir else Path(root_dir) / f"ppo_nav_{timestamp}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -91,92 +118,112 @@ class TrainingLogger:
         self._update_rows: list[dict[str, Any]] = []
         self._live_figures: dict[str, tuple[Any, Any]] = {}
 
-        self._init_csv_files()
+        if resume_episode is None:
+            self._init_csv_files()
+        else:
+            self._resume_csv_files(resume_episode, resume_update_step)
         if self.live_plot_enabled:
             self._init_live_windows()
 
     def _init_csv_files(self):
-        self._write_csv_header(
-            self.episode_csv_path,
-            [
-                "episode",
-                "episode_return",
-                "steps",
-                "episode_time_sec",
-                "arrived",
-                "collided",
-                "timeout",
-                "actor_loss",
-                "critic_loss",
-                "total_loss",
-                "entropy",
-                "auc_return",
-                "first_arrive_episode",
-                "teacher_epsilon",
-                "apf_steps",
-                "ppo_steps",
-                "apf_step_ratio",
-                "ppo_step_ratio",
-                "ppo_success_estimate_episode",
-                "ppo_success_rate_est_total",
-                "ppo_success_rate_est_sn",
-                "ppo_success_rate_est_sn_window",
-                "success_rate_total",
-                "collision_rate_total",
-                "avg_episode_time_total",
-                "avg_steps_total",
-            ],
-        )
-        self._write_csv_header(
-            self.summary_csv_path,
-            [
-                "update_step",
-                "buffer_size",
-                "actor_loss",
-                "critic_loss",
-                "aux_loss",
-                "smooth_loss",
-                "total_loss",
-                "entropy",
-                "grad_norm",
-                "sequence_count",
-                "mean_sequence_len",
-                "total_episodes",
-                "success_rate_total",
-                "collision_rate_total",
-                "avg_episode_time_total",
-                "avg_steps_total",
-                "auc_return",
-                "first_arrive_episode",
-                "teacher_epsilon_latest",
-                "apf_step_ratio_total",
-                "ppo_step_ratio_total",
-                "ppo_success_rate_est_total",
-                "ppo_success_rate_est_sn",
-                "ppo_success_rate_est_sn_window",
-            ],
-        )
-        self._write_csv_header(
-            self.update_csv_path,
-            [
-                "update_step",
-                "buffer_size",
-                "actor_loss",
-                "critic_loss",
-                "aux_loss",
-                "smooth_loss",
-                "total_loss",
-                "entropy",
-                "grad_norm",
-                "sequence_count",
-                "mean_sequence_len",
-            ],
-        )
+        self._write_csv_header(self.episode_csv_path, self.EPISODE_FIELDS)
+        self._write_csv_header(self.summary_csv_path, self.SUMMARY_FIELDS)
+        self._write_csv_header(self.update_csv_path, self.UPDATE_FIELDS)
 
     @staticmethod
     def _write_csv_header(path: Path, header: list[str]):
         with path.open("w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(header)
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        if value in (None, ""):
+            return default
+        return int(float(value))
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        if value in (None, ""):
+            return default
+        return float(value)
+
+    def _read_csv_dicts(self, path: Path) -> list[dict[str, Any]]:
+        if not path.is_file():
+            return []
+        with path.open("r", newline="", encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
+
+    def _coerce_csv_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        int_fields = {
+            "episode", "steps", "arrived", "collided", "timeout", "first_arrive_episode",
+            "apf_steps", "ppo_steps", "update_step", "buffer_size", "sequence_count",
+            "total_episodes",
+        }
+        coerced: dict[str, Any] = {}
+        for key, value in row.items():
+            if value in (None, ""):
+                coerced[key] = None
+            elif key in int_fields:
+                coerced[key] = self._to_int(value)
+            else:
+                coerced[key] = self._to_float(value)
+        for field in self.EPISODE_FIELDS + self.SUMMARY_FIELDS + self.UPDATE_FIELDS:
+            coerced.setdefault(field, None)
+        return coerced
+
+    def _rewrite_csv_dicts(self, path: Path, fieldnames: list[str], rows: list[dict[str, Any]]):
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field) for field in fieldnames})
+
+    def _resume_csv_files(self, resume_episode: int, resume_update_step: int | None):
+        episode_rows = [
+            self._coerce_csv_row(row) for row in self._read_csv_dicts(self.episode_csv_path)
+            if self._to_int(row.get("episode"), -1) <= resume_episode
+        ]
+        self._episode_rows = episode_rows
+        self._rewrite_csv_dicts(self.episode_csv_path, self.EPISODE_FIELDS, episode_rows)
+
+        update_rows = [self._coerce_csv_row(row) for row in self._read_csv_dicts(self.update_csv_path)]
+        summary_rows = [self._coerce_csv_row(row) for row in self._read_csv_dicts(self.summary_csv_path)]
+        if resume_update_step is not None:
+            update_rows = [
+                row for row in update_rows
+                if self._to_int(row.get("update_step"), -1) <= resume_update_step
+            ]
+            summary_rows = [
+                row for row in summary_rows
+                if self._to_int(row.get("update_step"), -1) <= resume_update_step
+            ]
+
+        self._update_rows = update_rows
+        self._summary_rows = summary_rows
+        self._rewrite_csv_dicts(self.update_csv_path, self.UPDATE_FIELDS, update_rows)
+        self._rewrite_csv_dicts(self.summary_csv_path, self.SUMMARY_FIELDS, summary_rows)
+        self._restore_episode_totals()
+
+    def _restore_episode_totals(self):
+        self.total_episodes = len(self._episode_rows)
+        self.arrive_count = sum(self._to_int(row.get("arrived")) for row in self._episode_rows)
+        self.collision_count = sum(self._to_int(row.get("collided")) for row in self._episode_rows)
+        self.total_episode_time = sum(self._to_float(row.get("episode_time_sec")) for row in self._episode_rows)
+        self.total_steps = sum(self._to_int(row.get("steps")) for row in self._episode_rows)
+        self.return_auc = sum(self._to_float(row.get("episode_return")) for row in self._episode_rows)
+        self.total_apf_steps = sum(self._to_int(row.get("apf_steps")) for row in self._episode_rows)
+        self.total_ppo_steps = sum(self._to_int(row.get("ppo_steps")) for row in self._episode_rows)
+        self.ppo_success_estimate_sum = sum(
+            self._to_float(row.get("ppo_success_estimate_episode")) for row in self._episode_rows
+        )
+        self.ppo_success_weight_sum = sum(
+            self._to_float(row.get("ppo_step_ratio")) for row in self._episode_rows
+        )
+        self.first_arrive_episode = None
+        for row in self._episode_rows:
+            if self._to_int(row.get("arrived")):
+                self.first_arrive_episode = self._to_int(row.get("episode"))
+                break
 
     @staticmethod
     def _append_csv_row(path: Path, row: list[Any]):
@@ -197,6 +244,7 @@ class TrainingLogger:
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
             "grad_norm": update_metrics.get("grad_norm"),
+            "critic_grad_norm": update_metrics.get("critic_grad_norm"),
             "sequence_count": update_metrics.get("sequence_count"),
             "mean_sequence_len": update_metrics.get("mean_sequence_len"),
         }
@@ -210,6 +258,7 @@ class TrainingLogger:
             row_dict["total_loss"],
             row_dict["entropy"],
             row_dict["grad_norm"],
+            row_dict["critic_grad_norm"],
             row_dict["sequence_count"],
             row_dict["mean_sequence_len"],
         ]
@@ -226,6 +275,7 @@ class TrainingLogger:
             "total_loss": update_metrics.get("total_loss"),
             "entropy": update_metrics.get("entropy"),
             "grad_norm": update_metrics.get("grad_norm"),
+            "critic_grad_norm": update_metrics.get("critic_grad_norm"),
             "sequence_count": update_metrics.get("sequence_count"),
             "mean_sequence_len": update_metrics.get("mean_sequence_len"),
             "total_episodes": self.total_episodes,
@@ -255,6 +305,7 @@ class TrainingLogger:
                 summary_row["total_loss"],
                 summary_row["entropy"],
                 summary_row["grad_norm"],
+                summary_row["critic_grad_norm"],
                 summary_row["sequence_count"],
                 summary_row["mean_sequence_len"],
                 summary_row["total_episodes"],
@@ -281,6 +332,8 @@ class TrainingLogger:
             self.writer.add_scalar("loss/total", update_metrics["total_loss"], global_step)
             self.writer.add_scalar("policy/entropy", update_metrics["entropy"], global_step)
             self.writer.add_scalar("train/grad_norm", update_metrics["grad_norm"], global_step)
+            if update_metrics.get("critic_grad_norm") is not None:
+                self.writer.add_scalar("train/critic_grad_norm", update_metrics["critic_grad_norm"], global_step)
             self.writer.add_scalar("train/sequence_count", update_metrics["sequence_count"], global_step)
             self.writer.add_scalar("train/mean_sequence_len", update_metrics["mean_sequence_len"], global_step)
             self.writer.add_scalar("metrics/apf_step_ratio_total", summary_row["apf_step_ratio_total"], global_step)
@@ -583,6 +636,17 @@ class TrainingLogger:
             "Update Step",
             "Samples",
         )
+        self._save_multi_line_plot(
+            self.plot_dir / "gradient_norms.png",
+            steps,
+            [
+                ("Total Grad Norm", [row["grad_norm"] for row in self._update_rows]),
+                ("Critic Grad Norm", [row["critic_grad_norm"] for row in self._update_rows]),
+            ],
+            "Gradient Norms",
+            "Update Step",
+            "Norm",
+        )
 
     def _plot_summary_metrics(self):
         if plt is None or not self._summary_rows:
@@ -747,9 +811,12 @@ class TrainingLogger:
         axes[0, 1].set_title("Entropy")
         axes[1, 0].plot(steps, [row["buffer_size"] for row in self._update_rows], color="tab:brown")
         axes[1, 0].set_title("Buffer Size")
+        axes[1, 1].plot(steps, [row["grad_norm"] for row in self._update_rows], label="Total")
+        axes[1, 1].plot(steps, [row["critic_grad_norm"] for row in self._update_rows], label="Critic")
+        axes[1, 1].set_title("Gradient Norm")
+        axes[1, 1].legend()
         for ax in axes.flat:
             ax.grid(True, alpha=0.3)
-        axes[1, 1].axis("off")
         fig.tight_layout()
         fig.canvas.draw_idle()
 

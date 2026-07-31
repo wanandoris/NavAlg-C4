@@ -1,5 +1,6 @@
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -270,6 +271,7 @@ def calc_apf_heading_diff(
     heading_world: float | None,
     target_heading_world: float | None,
     config: RewardConfig = DEFAULT_REWARD_CONFIG,
+    obstacle_points: Sequence[tuple[float, float]] | None = None,
 ) -> float:
     heading_world = 0.0 if heading_world is None else heading_world
     if target_heading_world is None:
@@ -282,15 +284,18 @@ def calc_apf_heading_diff(
 
     repulsive_x = 0.0
     repulsive_y = 0.0
-    rho = max(float(obstacle_min_range), 1e-3)
     rho_0 = config.apf_obstacle_influence_range
-    if rho < rho_0:
+    points = obstacle_points or [(obstacle_min_range, obstacle_angle)]
+    for point_range, point_angle in points:
+        rho = max(float(point_range), 1e-3)
+        if rho >= rho_0:
+            continue
         force_magnitude = config.apf_repulsive_gain * (1.0 / rho - 1.0 / rho_0) / (rho * rho)
-        obstacle_relative_deg = float(obstacle_angle)
+        obstacle_relative_deg = float(point_angle)
         obstacle_world_deg = heading_world + obstacle_relative_deg
         obstacle_rad = math.radians(obstacle_world_deg)
-        repulsive_x = -force_magnitude * math.cos(obstacle_rad)
-        repulsive_y = -force_magnitude * math.sin(obstacle_rad)
+        repulsive_x += -force_magnitude * math.cos(obstacle_rad)
+        repulsive_y += -force_magnitude * math.sin(obstacle_rad)
 
     apf_x = attractive_x + repulsive_x
     apf_y = attractive_y + repulsive_y

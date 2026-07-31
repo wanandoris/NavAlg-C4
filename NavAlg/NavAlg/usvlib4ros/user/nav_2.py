@@ -1,6 +1,7 @@
 ﻿import math
 import time
 import threading
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from usvlib4ros.navigation.route_plan_service import RoutePlanService
 from usvlib4ros.msg.global_data import GlobalData, DictToObject, Point, Constants
 from usvlib4ros.msg.parameter import Parameter
 from usvlib4ros.usvRosUtil import LogUtil
+from usvlib4ros.user.heading_limiter import GuidedHeadingSlewLimiter
 from usvlib4ros.user.pid_controller import PID, PIDConfig
 from usvlib4ros.user.PP0_2 import PPO, device
 from usvlib4ros.user.reward import RewardConfig, compute_reward_breakdown, RewardBreakdown, calc_apf_heading_diff
@@ -27,48 +29,50 @@ HAS_CONTINUOUS_ACTION = True  # 是否使用连续动作空间
 LR_ACTOR = 0.00003
 LR_CRITIC = 0.0001
 GAMMA = 0.99           # 折扣因子
-K_EPOCHS = 8           # PPO更新轮数
+K_EPOCHS = 6          # PPO更新轮数
 EPS_CLIP = 0.2         # PPO裁剪系数
-ACTION_STD_INIT = 0.45  # 连续动作标准差初始化
-UPDATE_INTERVAL = 256  # PPO更新间隔(步数)
-MIN_BUFFER_SIZE_FOR_UPDATE = 256
+ACTION_STD_INIT = 0.35  # 连续动作标准差初始化
+UPDATE_INTERVAL = 512  # PPO更新间隔(步数)
+MIN_BUFFER_SIZE_FOR_UPDATE = 512
 AUX_LOSS_COEF = 0.1    # GRU辅助预测损失权重
 SMOOTH_LOSS_COEF = 0.005  # 一阶航迹平滑损失权重,约束连续动作中的转向变化
 GRU_INPUT_DIM = 128     # 状态输入投影维度
 GRU_HIDDEN_DIM = 256    # Actor/Critic各自GRU隐藏维度
 AUX_HIDDEN_DIM = 128    # 辅助预测头隐藏维度
 MIXED_ROTATE_CONTROL = True  # 是否启用APF-PID与PPO混合切换
-TEACHER_EPSILON_DECAY = 0.0009  # APF-PID作为专家的概率衰减系数
-TEACHER_EPSILON_MIN = 0.01    # 专家概率下限
+TEACHER_EPSILON_DECAY = 0.0008  # APF-PID作为专家的概率衰减系数
+TEACHER_EPSILON_MIN = 0.05    # 专家概率下限
 TEACHER_EPSILON_MAX = 1.00
 TEACHER_PERF_WINDOW_SIZE = 50
 TEACHER_PERF_MIN_WEIGHT = 5.0
-TEACHER_PERF_THRESHOLD_HIGH = 0.75
-TEACHER_PERF_THRESHOLD_LOW = 0.45
+TEACHER_PERF_THRESHOLD_HIGH = 0.65
+TEACHER_PERF_THRESHOLD_LOW = 0.350
 TEACHER_PERF_DECAY_FACTOR = 0.95
 TEACHER_PERF_INCREASE_FACTOR = 1.05
 
 # ==================== 奖励相关 ====================
-REWARD_ARRIVE_BONUS = 80
-REWARD_COLLISION_PENALTY = -50
-REWARD_WEIGHT_DISTANCE = 1
-REWARD_WEIGHT_OBSTACLE = 0.6
-REWARD_WEIGHT_HEADING = 0.6
-REWARD_WEIGHT_TIME = 0.2
-REWARD_PROGRESS_SCALE = 14.0
-REWARD_PROGRESS_WEIGHT = 0.7
-REWARD_PROXIMITY_WEIGHT = 0.3
+REWARD_ARRIVE_BONUS = 50
+REWARD_COLLISION_PENALTY = -30
+REWARD_WEIGHT_DISTANCE = 0.8
+REWARD_WEIGHT_OBSTACLE = 0.5
+REWARD_WEIGHT_HEADING = 0.5
+REWARD_WEIGHT_TIME = 0.15
+REWARD_PROGRESS_SCALE = 10.0
+REWARD_PROGRESS_WEIGHT = 0.6
+REWARD_PROXIMITY_WEIGHT = 0.25
 REWARD_PROXIMITY_EXPONENT = 1.5
 REWARD_PROXIMITY_NORMALIZER = 12.0
 REWARD_STEP_PENALTY = -0.005
 REWARD_MIN_ARRIVE_TIME_WEIGHT = 0.35
 REWARD_APF_ATTRACTIVE_GAIN = 1.0
-REWARD_APF_REPULSIVE_GAIN = 8.0
+REWARD_APF_REPULSIVE_GAIN = 10.0
 REWARD_APF_OBSTACLE_INFLUENCE_RANGE = 2.5
 REWARD_TIME_EXPONENT = 1.5
+APF_OBSTACLE_MAX_POINTS = 5
+APF_OBSTACLE_MIN_INDEX_GAP = 4
 
 # ==================== 导航/PID 相关 ====================
-LASER_MAX_RANGE = 10.0        # 激光雷达有效最大距离(m)
+LASER_MAX_RANGE = 20.0        # 激光雷达有效最大距离(m)
 COLLISION_DISTANCE = 0.6     # 碰撞判定阈值(m)
 ARRIVE_DISTANCE = 1.5        # 到达目标判定阈值(m)
 DEFAULT_SPEED = 1.0          # 默认速度(m/s)
@@ -77,12 +81,23 @@ TARGET_SLOW_RANGE = 3.0      # 接近目标时减速阈值(m)
 ANGULAR_VELOCITY_MAX = 100   # 策略/奖励/预测使用的内部最大角速度(°/s)
 ACTION_TO_SPEED_CONTINOUS_SCALE = 120 # 连续动作映射到速度缩放因子
 CONTROL_DT = 0.01            # 控制周期(s),用于连续动作 （同样与时间刻相关）
-PPO_TARGET_HEADING_MAX_OFFSET = 180.0  # PPO目标航向最大偏转角(度)
+PPO_TARGET_HEADING_MAX_OFFSET = 120.0  # PPO目标航向最大偏转角(度)
+PPO_HEADING_SLEW_LIMIT_ENABLED = True  # 是否限制相邻PPO目标航向的突变
+PPO_HEADING_MIN_CHANGE = 30.0          # PPO相邻输出允许的最低变化范围(度)
+PPO_HEADING_ERROR_MARGIN = 20.0        # 在上一步PPO/APF角差上增加的余量(度)
 ROTATE_CONTROL_MODE = "PPO"  # 可选: "PPO" | "PID"
-HEADING_PID_KP = 1.2
-HEADING_PID_KI = 0.02
-HEADING_PID_KD = 0.15
-HEADING_PID_INTEGRAL_LIMIT = 60.0
+HEADING_PID_KP = 0.75
+HEADING_PID_KI = 0.0
+HEADING_PID_KD = 0.05
+HEADING_PID_INTEGRAL_LIMIT = 20.0
+HEADING_PID_DEADBAND = 3.0
+HEADING_PID_DT_MIN = 0.02
+HEADING_PID_DT_MAX = 0.2
+SPEED_OBSTACLE_DAMPING_RANGE = 8.0
+SPEED_OBSTACLE_DAMPING_K = 5.0
+PPO_SPEED_BIAS = 5.0
+PPO_SPEED_MIN = 5.0
+PPO_SPEED_MAX = 15.0
 
 # ==================== 其它  ====================
 MAX_EPOCH = 100000       # 最大训练轮数
@@ -91,6 +106,8 @@ MAX_EPISODE_TIME = 300  # 每轮最大时间(秒)（同样与时间刻相关）
 CHECKPOINT_INTERVAL = 100  # 模型保存间隔(轮数)
 IS_LOAD = False
 NETWORK_PATH = r"D:\C4\Results\ppo_nav_latest\checkpoints\PPO_ship_obstacle_latest.pth"
+RESUME_LOGS_WITH_CHECKPOINT = True  # 加载形如 PPO_ship_obstacle_8700.pth 时, CSV/TensorBoard 续写到原 run 目录
+RESUME_EPISODE_OVERRIDE = None       # 需要手动指定续接编号时填 int, 例如 8700
 MAX_RESET_RETRIES = 5
 ENABLE_APF_DEBUG_VIEW = True         # 是否打开APF方向实时调试窗口
 APF_DEBUG_WINDOW_NAME = "APF Heading Debug"
@@ -106,6 +123,10 @@ RESET_STATUS_SLEEP = 0.1 / TIME_RATE      # 等待reset_status轮询间隔(秒)
 LASER_TIMEOUT = 2 / TIME_RATE             # 等待激光数据超时(秒)
 LASER_POLL_SLEEP = 0.1 / TIME_RATE        # 激光轮询间隔(秒)
 RESET_SETTLE_DELAY = 2 / TIME_RATE       # 每轮复位后等待仿真刷新(秒)
+STOP_COMMAND_TIMEOUT = 2 / TIME_RATE      # 每轮开始前等待速度/角速度归零超时(秒)
+STOP_COMMAND_POLL_SLEEP = 0.1 / TIME_RATE # 速度/角速度归零轮询间隔(秒)
+STOP_SPEED_EPS = 0.03                     # 认为速度已归零的阈值
+STOP_ROTATE_EPS = 0.5                     # 认为角速度已归零的阈值
 
 
 @dataclass
@@ -137,6 +158,23 @@ class PPONav:
         self.navThread.setDaemon(True)
         self.navThread.start()
 
+    @staticmethod
+    def _resolve_resume_episode(checkpoint_path: Path | None) -> int | None:
+        if not IS_LOAD or not RESUME_LOGS_WITH_CHECKPOINT:
+            return None
+        if RESUME_EPISODE_OVERRIDE is not None:
+            return int(RESUME_EPISODE_OVERRIDE)
+        if checkpoint_path is None:
+            return None
+        match = re.search(r"PPO_ship_obstacle_(\d+)\.pth$", checkpoint_path.name)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _resolve_resume_run_dir(checkpoint_path: Path | None, resume_episode: int | None) -> Path | None:
+        if resume_episode is None or checkpoint_path is None:
+            return None
+        return checkpoint_path.parent.parent
+
     def __init__(self, ros_ctrl: Ros2Controller, global_data: GlobalData, xyzAxis: bool = True):
         self.episode_start_time = None
         self.ros_ctrl: Ros2Controller = ros_ctrl
@@ -144,7 +182,21 @@ class PPONav:
         self.navThread = None
         self.current_episode_step = 0
 
-        self.training_logger = TrainingLogger(root_dir="Results")
+        checkpoint_path = Path(NETWORK_PATH) if IS_LOAD else None
+        self.resume_episode = self._resolve_resume_episode(checkpoint_path)
+        resume_run_dir = self._resolve_resume_run_dir(checkpoint_path, self.resume_episode)
+        self.episode_log_offset = self.resume_episode + 1 if self.resume_episode is not None else 0
+        resume_update_step = (
+            self.resume_episode * MAX_STEP_PER_EPISODE
+            if self.resume_episode is not None
+            else None
+        )
+        self.training_logger = TrainingLogger(
+            root_dir="Results",
+            run_dir=resume_run_dir,
+            resume_episode=self.resume_episode,
+            resume_update_step=resume_update_step,
+        )
 
         self.last_distance = None
         self.enable_apf_debug_view = ENABLE_APF_DEBUG_VIEW
@@ -160,12 +212,20 @@ class PPONav:
             aux_hidden_dim=AUX_HIDDEN_DIM,
         )
         self.ppo_hidden = None
+        self.ppo_heading_limiter = GuidedHeadingSlewLimiter(
+            PPO_HEADING_MIN_CHANGE,
+            PPO_HEADING_ERROR_MARGIN,
+        )
         if IS_LOAD:
-            checkpoint_path = Path(NETWORK_PATH)
             if not checkpoint_path.is_file():
                 raise FileNotFoundError(f"PPO checkpoint not found: {checkpoint_path}")
             self.ppo_agent.load(str(checkpoint_path))
             LogUtil.info(f"已加载PPO模型: {checkpoint_path}")
+            if self.resume_episode is not None:
+                LogUtil.info(
+                    f"训练日志续接到 {self.training_logger.run_dir}, "
+                    f"下一模型回合编号: {self.episode_log_offset}"
+                )
         self.next_state = None
         # 航线相关
         self.route = None
@@ -220,10 +280,11 @@ class PPONav:
                 kp=HEADING_PID_KP,
                 ki=HEADING_PID_KI,
                 kd=HEADING_PID_KD,
-                output_limit=ANGULAR_VELOCITY_MAX,
+                # output_limit=ANGULAR_VELOCITY_MAX,
                 integral_limit=HEADING_PID_INTEGRAL_LIMIT,
             )
         )
+        self.last_pid_update_time = None
         self.last_heading_debug = {
             "ppo_target_heading": 0.0,
             "pid_target_heading": 0.0,
@@ -245,14 +306,16 @@ class PPONav:
                     time.sleep(TASK_WAIT_SLEEP)
 
                 for epoch in range(MAX_EPOCH):
+                    system_episode = epoch + 1
+                    model_episode = epoch + self.episode_log_offset
                     if self.global_data.device_data.task_status == 0:
                         LogUtil.info("停止训练")
                         break
 
                     try:
-                        LogUtil.info(f"第 {epoch} 轮训练开始")
+                        LogUtil.info(f"第 {system_episode} 轮训练开始, 模型回合编号 {model_episode}")
                         last_update_metrics = None
-                        self.teacher_prob = self._update_teacher_probability(epoch)
+                        self.teacher_prob = self._update_teacher_probability(model_episode)
 
                         # 加载航线
                         self.route = self.ros_ctrl.getRoute()
@@ -287,12 +350,12 @@ class PPONav:
                                 self.timeout = True
                                 break
 
-                            self.done = self.navigationHandler(self.next_state, epoch, step)
+                            self.done = self.navigationHandler(self.next_state, system_episode, step)
 
                             # 定期更新PPO
                             if step > 0 and step % UPDATE_INTERVAL == 0:
                                 last_update_metrics = self._try_update_ppo(
-                                    epoch * MAX_STEP_PER_EPISODE + step
+                                    model_episode * MAX_STEP_PER_EPISODE + step
                                 )
 
                             self.setMonitorParameterValue()
@@ -304,20 +367,20 @@ class PPONav:
 
                         last_update_metrics = (
                             self._try_update_ppo(
-                                epoch * MAX_STEP_PER_EPISODE + self.episode_step_count,
+                                model_episode * MAX_STEP_PER_EPISODE + self.episode_step_count,
                                 force=True,
                             )
                             or last_update_metrics
                         )
 
                         # 定期保存模型
-                        if epoch % CHECKPOINT_INTERVAL == 0:
-                            checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{epoch}.pth"
+                        if model_episode % CHECKPOINT_INTERVAL == 0:
+                            checkpoint_path = self.training_logger.checkpoint_dir / f"PPO_ship_obstacle_{model_episode}.pth"
                             self.ppo_agent.save(checkpoint_path)
                             LogUtil.info(f"模型已保存: {checkpoint_path}")
 
                         self.training_logger.log_episode(
-                            episode=epoch,
+                            episode=model_episode,
                             episode_return=self.episode_reward_sum,
                             steps=self.episode_step_count,
                             episode_time_sec=(time.time() - self.episode_start_time) if self.episode_start_time else 0.0,
@@ -361,6 +424,8 @@ class PPONav:
             "selected_target_heading": 0.0,
         }
         self.heading_pid.reset()
+        self.ppo_heading_limiter.reset()
+        self.last_pid_update_time = None
 
     # ==================== 状态获取 ====================
 
@@ -433,6 +498,27 @@ class PPONav:
         obstacle_idx = int(np.argmin(scan_range))
         obstacle_min_range = round(float(scan_range[obstacle_idx]), 2)
         return obstacle_min_range, self._scan_feature_index_to_relative_angle(obstacle_idx)
+
+    def _select_apf_obstacle_points(self, scan_range: list) -> list[tuple[float, float]]:
+        candidates: list[tuple[int, float]] = []
+        for idx, value in enumerate(scan_range):
+            if not np.isfinite(value):
+                continue
+            distance = float(value)
+            if 0.0 < distance < REWARD_APF_OBSTACLE_INFLUENCE_RANGE:
+                candidates.append((idx, distance))
+
+        selected: list[tuple[int, float]] = []
+        for idx, distance in sorted(candidates, key=lambda item: item[1]):
+            if all(abs(idx - selected_idx) >= APF_OBSTACLE_MIN_INDEX_GAP for selected_idx, _ in selected):
+                selected.append((idx, distance))
+                if len(selected) >= APF_OBSTACLE_MAX_POINTS:
+                    break
+
+        return [
+            (round(distance, 2), self._scan_feature_index_to_relative_angle(idx))
+            for idx, distance in selected
+        ]
 
     @staticmethod
     def _scan_feature_index_to_relative_angle(index: int | float) -> float:
@@ -537,6 +623,30 @@ class PPONav:
         self.training_logger.log_update(global_step, update_metrics)
         return update_metrics
 
+    def _ensure_vehicle_stopped_before_episode(self, nav_context: dict) -> bool:
+        start_time = time.time()
+        while True:
+            pose = self.global_data.scada_data.pose
+            heading = getattr(pose, "yaw", 0.0)
+            speed = abs(float(getattr(pose, "speed", 0.0)))
+            rotate_speed = abs(float(getattr(pose, "rotate_speed", 0.0)))
+            self.global_data.updateThrottleRudderOutput(
+                0,
+                0,
+                heading,
+                self.destPointIndex,
+                nav_context["shipToNextWPDistance"],
+            )
+            if speed <= STOP_SPEED_EPS and rotate_speed <= STOP_ROTATE_EPS:
+                return True
+            if time.time() - start_time > STOP_COMMAND_TIMEOUT:
+                LogUtil.info(
+                    f"新一轮开始前速度/角速度未归零: speed={speed:.3f}, "
+                    f"rotate_speed={rotate_speed:.3f}"
+                )
+                return False
+            time.sleep(STOP_COMMAND_POLL_SLEEP)
+
     def _reset_and_prepare_episode(self) -> bool:
         for attempt in range(MAX_RESET_RETRIES):
             self.ros_ctrl.reset_unity()
@@ -564,6 +674,8 @@ class PPONav:
             )
             obstacle_min_range = initial_state[-2]
             if obstacle_min_range > COLLISION_DISTANCE:
+                if not self._ensure_vehicle_stopped_before_episode(nav_context):
+                    continue
                 self.next_state = initial_state
                 self.done = False
                 return True
@@ -581,6 +693,7 @@ class PPONav:
         obstacle_min_range: float,
         obstacle_angle: float,
         angle_diff: float,
+        obstacle_points: list[tuple[float, float]] | None = None,
     ) -> tuple[float, float]:
         heading_world = self._normalize_heading_360(heading)
         target_world = self._normalize_heading_360(target_heading_world)
@@ -592,6 +705,7 @@ class PPONav:
             heading_world=heading_world,
             target_heading_world=target_world,
             config=self.reward_config,
+            obstacle_points=obstacle_points,
         )
         apf_target_heading = self._normalize_signed_angle_diff(heading + apf_heading_diff)
         return apf_target_heading, apf_heading_diff
@@ -605,13 +719,57 @@ class PPONav:
         obstacle_min_range: float,
         obstacle_angle: float,
         angle_diff: float,
+        guidance_heading: float,
     ) -> tuple[float, float]:
         ppo_heading_diff = self._clip(turn_ratio, 1.0) * PPO_TARGET_HEADING_MAX_OFFSET
         ppo_target_heading = self._normalize_signed_angle_diff(heading + ppo_heading_diff)
+        if PPO_HEADING_SLEW_LIMIT_ENABLED:
+            ppo_target_heading = self.ppo_heading_limiter.apply(
+                ppo_target_heading,
+                guidance_heading,
+            )
+            ppo_heading_diff = self._normalize_signed_angle_diff(ppo_target_heading - heading)
         return ppo_target_heading, ppo_heading_diff
 
     def _pid_output_to_rudder_percent(self, pid_output: float) -> float:
-        return round(self._clip(pid_output, ANGULAR_VELOCITY_MAX), 0)
+        # return round(self._clip(pid_output, ANGULAR_VELOCITY_MAX), 0)
+        return round(pid_output, 0)
+
+    def _update_heading_pid(self, heading_error: float) -> float:
+        if abs(heading_error) < HEADING_PID_DEADBAND:
+            heading_error = 0.0
+
+        now = time.time()
+        if self.last_pid_update_time is None:
+            dt = CONTROL_DT
+        else:
+            dt = now - self.last_pid_update_time
+        self.last_pid_update_time = now
+        dt = max(HEADING_PID_DT_MIN, min(dt, HEADING_PID_DT_MAX))
+        return self.heading_pid.update(heading_error, dt)
+
+    @staticmethod
+    def _apply_obstacle_speed_damping(advise_speed: float, obstacle_min_range: float) -> float:
+        if SPEED_OBSTACLE_DAMPING_RANGE <= 0:
+            return advise_speed
+        proximity = max(
+            0.0,
+            min(
+                (SPEED_OBSTACLE_DAMPING_RANGE - obstacle_min_range)
+                / SPEED_OBSTACLE_DAMPING_RANGE,
+                1.0,
+            ),
+        )
+        damping = math.exp(-SPEED_OBSTACLE_DAMPING_K * proximity)
+        return advise_speed * damping
+
+    @staticmethod
+    def _clamp_ppo_speed(advise_speed: float) -> float:
+        return max(PPO_SPEED_MIN, min(advise_speed, PPO_SPEED_MAX))
+
+    def _ppo_speed_to_throttle(self, speed_ratio: float) -> float:
+        advise_speed = speed_ratio * ACTION_TO_SPEED_CONTINOUS_SCALE + PPO_SPEED_BIAS
+        return self._clamp_ppo_speed(advise_speed)
 
     def step(self, state: list, action: np.ndarray, laser_scan, heading: float,
              shipToNextWPDistance: float,degreeAship: float, max_distance: float,prev_distance: float) -> StepResult:
@@ -726,6 +884,8 @@ class PPONav:
     def _action_to_control(self, action: np.ndarray, obstacle_min_range: float,
                            current_distance: float, heading: float,
                            target_heading_world: float, state: list) -> tuple:
+        laser_features = state[:-6] if len(state) > 6 else []
+        apf_obstacle_points = self._select_apf_obstacle_points(laser_features)
         if HAS_CONTINUOUS_ACTION:
             """根据模式选择目标航向,再统一交给PID输出舵量。"""
             action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
@@ -740,6 +900,7 @@ class PPONav:
                 obstacle_min_range=obstacle_min_range,
                 obstacle_angle=state[-1],
                 angle_diff=state[-4],
+                obstacle_points=apf_obstacle_points,
             )
             ppo_target_heading, ppo_heading_diff = self._compute_ppo_target_heading(
                 heading=heading,
@@ -749,6 +910,7 @@ class PPONav:
                 obstacle_min_range=obstacle_min_range,
                 obstacle_angle=state[-1],
                 angle_diff=state[-4],
+                guidance_heading=apf_target_heading,
             )
             use_teacher = False
             if MIXED_ROTATE_CONTROL:
@@ -762,7 +924,7 @@ class PPONav:
                 self.episode_ppo_steps += 1
             selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
             heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
-            adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
+            adviseRotate = self._pid_output_to_rudder_percent(self._update_heading_pid(heading_error))
             self.last_heading_debug = {
                 "ppo_target_heading": float(ppo_target_heading),
                 "pid_target_heading": float(apf_target_heading),
@@ -772,15 +934,9 @@ class PPONav:
             }
 
             # 自适应速度
-            adviseSpeed = speed_ratio * ACTION_TO_SPEED_CONTINOUS_SCALE
-
-            if obstacle_min_range < 1.0:
-                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.2)
-            elif obstacle_min_range < 2.0:
-                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.4)
-
-            if current_distance < TARGET_SLOW_RANGE:
-                adviseSpeed = min(adviseSpeed, ACTION_TO_SPEED_CONTINOUS_SCALE * 0.3)
+            adviseSpeed = self._ppo_speed_to_throttle(speed_ratio)
+            adviseSpeed = self._apply_obstacle_speed_damping(adviseSpeed, obstacle_min_range)
+            adviseSpeed = self._clamp_ppo_speed(adviseSpeed)
 
         else:
             """将离散动作映射为目标航向后再交给PID。"""
@@ -799,6 +955,7 @@ class PPONav:
                 obstacle_min_range=obstacle_min_range,
                 obstacle_angle=state[-1],
                 angle_diff=state[-4],
+                obstacle_points=apf_obstacle_points,
             )
             ppo_target_heading, ppo_heading_diff = self._compute_ppo_target_heading(
                 heading=heading,
@@ -808,6 +965,7 @@ class PPONav:
                 obstacle_min_range=obstacle_min_range,
                 obstacle_angle=state[-1],
                 angle_diff=state[-4],
+                guidance_heading=apf_target_heading,
             )
             use_teacher = self.rotate_control_mode == "PID"
             self.teacher_last_selected = use_teacher
@@ -817,7 +975,8 @@ class PPONav:
                 self.episode_ppo_steps += 1
             selected_target_heading = apf_target_heading if use_teacher else ppo_target_heading
             heading_error = self._normalize_signed_angle_diff(selected_target_heading - heading)
-            adviseRotate = self._pid_output_to_rudder_percent(self.heading_pid.update(heading_error, CONTROL_DT))
+            adviseRotate = self._pid_output_to_rudder_percent(self._update_heading_pid(heading_error))
+            adviseSpeed = self._apply_obstacle_speed_damping(adviseSpeed, obstacle_min_range)
             self.last_heading_debug = {
                 "ppo_target_heading": float(ppo_target_heading),
                 "pid_target_heading": float(apf_target_heading),

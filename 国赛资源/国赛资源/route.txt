@@ -1,0 +1,349 @@
+
+{
+    "routes" : {
+        "海韵湖" : [
+            {
+                "Name" : "test",
+                "Desc" : "",
+                "Points" : [
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点1",
+                        "Position"    : [
+                            381.4022,
+                            24.3,
+                            151.9669
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点2",
+                        "Position"    : [
+                            409.5164,
+                            24.3,
+                            150.0027
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点3",
+                        "Position"    : [
+                            427.7698,
+                            24.3,
+                            156.9944
+                        ]
+                    }
+                ],
+                "Obstacles" : [
+                ],
+                "Id"        : "3c3c403e67574e0397a065bee3cc677f",
+                "Version"   : 4
+            }
+        ],
+        "北湖"  : [
+            {
+                "Name" : "National_Test",
+                "Desc" : "",
+                "Points" : [
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点1",
+                        "Position"    : [
+                            -420.6797,
+                            24.3,
+                            121.8303
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点2",
+                        "Position"    : [
+                            -419.4843,
+                            24.3,
+                            126.3
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点3",
+                        "Position"    : [
+                            -416.8416,
+                            24.3,
+                            129.278
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点4",
+                        "Position"    : [
+                            -414.7011,
+                            24.3,
+                            132.7207
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点5",
+                        "Position"    : [
+                            -414.2555,
+                            24.3,
+                            136.6062
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点6",
+                        "Position"    : [
+                            -414.949,
+                            24.3,
+                            140.5992
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点7",
+                        "Position"    : [
+                            -415.9917,
+                            24.3,
+                            145.1058
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点8",
+                        "Position"    : [
+                            -419.0906,
+                            24.3,
+                            148.3236
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点9",
+                        "Position"    : [
+                            -420.7667,
+                            24.3,
+                            152.0713
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点10",
+                        "Position"    : [
+                            -422.5685,
+                            24.3,
+                            156.855
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点11",
+                        "Position"    : [
+                            -427.6635,
+                            24.3,
+                            158.4829
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点12",
+                        "Position"    : [
+                            -432.5417,
+                            24.3,
+                            156.3548
+                        ]
+                    },
+                    {
+                        "CruiseSpeed" : 1.5,
+                        "Name"        : "导航点13",
+                        "Position"    : [
+                            -437.683,
+                            24.3,
+                            151.3683
+                        ]
+                    }
+                ],
+                "Obstacles" : [
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物1",
+                        "Position" : [
+                            -421.7807,
+                            24.3,
+                            125.2754
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物2",
+                        "Position" : [
+                            -418.066,
+                            24.3,
+                            124.4691
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物4",
+                        "Position" : [
+                            -414.887,
+                            24.3,
+                            134.9972
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物6",
+                        "Position" : [
+                            -417.517,
+                            24.3,
+                            146.6994
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物8",
+                        "Position" : [
+                            -421.8259,
+                            24.3,
+                            154.7814
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物9",
+                        "Position" : [
+                            -429.3872,
+                            24.3,
+                            159.0133
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物10",
+                        "Position" : [
+                            -428.8322,
+                            24.3,
+                            159.3697
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物11",
+                        "Position" : [
+                            -428.1176,
+                            24.3,
+                            159.6445
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物12",
+                        "Position" : [
+                            -427.3536,
+                            24.3,
+                            159.5617
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物13",
+                        "Position" : [
+                            -426.5607,
+                            24.3,
+                            159.2859
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物14",
+                        "Position" : [
+                            -433.8076,
+                            24.3,
+                            152.6908
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物15",
+                        "Position" : [
+                            -436.4937,
+                            24.3,
+                            155.0971
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物14",
+                        "Position" : [
+                            -413.5834,
+                            24.3,
+                            140.8578
+                        ]
+                    },
+                    {
+                        "ScalcX" : 3,
+                        "ScalcY" : 3,
+                        "ScalcZ" : 3,
+                        "Name"   : "障碍物16",
+                        "Position" : [
+                            -427.8123,
+                            24.3,
+                            155.7369
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物16",
+                        "Position" : [
+                            -419.1587,
+                            24.3,
+                            129.0384
+                        ]
+                    },
+                    {
+                        "ScalcX" : 1,
+                        "ScalcY" : 1,
+                        "ScalcZ" : 1,
+                        "Name"   : "障碍物16",
+                        "Position" : [
+                            -414.0165,
+                            24.3,
+                            130.6658
+                        ]
+                    }
+                ],
+                "Id"        : "aa74b6a21c9a4c53acccd4ba5e8abc57",
+                "Version"   : 46
+            }
+        ]
+    }
+}
